@@ -1,92 +1,51 @@
 import os
 import re
 import json
-import signal
 import asyncio
 import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
 from telegram import Update
-from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ──────────────────────────────────────────────
-# Configuração
-# ──────────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GRUPO_ID = os.environ.get("TELEGRAM_GRUPO_ID")
 
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN nao encontrado.")
-if not GRUPO_ID:
-    raise ValueError("TELEGRAM_GRUPO_ID nao encontrado.")
-
-# ──────────────────────────────────────────────
-# PID único
-# ──────────────────────────────────────────────
-PID_FILE = "/tmp/mypromo_bot.pid"
-
-def garantir_instancia_unica():
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                pid_antigo = int(f.read().strip())
-            if pid_antigo != os.getpid():
-                os.kill(pid_antigo, signal.SIGKILL)
-        except:
-            pass
-
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-
-def limpar_pid():
-    try:
-        os.remove(PID_FILE)
-    except:
-        pass
-
-# ──────────────────────────────────────────────
-# LOJAS
-# ──────────────────────────────────────────────
-LOJAS = {
-    "mercadolivre.com.br": "Mercado Livre",
-    "mercadolibre.com": "Mercado Livre",
-    "amazon.com.br": "Amazon",
-    "amazon.com": "Amazon",
-    "shopee.com.br": "Shopee",
-    "magazineluiza.com.br": "Magazine Luiza",
-    "magalu.com.br": "Magazine Luiza",
-    "americanas.com.br": "Americanas",
-    "casasbahia.com.br": "Casas Bahia",
-    "kabum.com.br": "KaBuM",
-    "aliexpress.com": "AliExpress"
-}
+scraper = cloudscraper.create_scraper()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "pt-BR,pt;q=0.9"
 }
 
-scraper = cloudscraper.create_scraper()
+# ─────────────────────────────
+# LOJAS
+# ─────────────────────────────
 
-# ──────────────────────────────────────────────
-# Nome da loja
-# ──────────────────────────────────────────────
+LOJAS = {
+    "amazon": "Amazon",
+    "mercadolivre": "Mercado Livre",
+    "shopee": "Shopee",
+    "magazineluiza": "Magazine Luiza",
+    "americanas": "Americanas",
+    "kabum": "KaBuM"
+}
+
 def nome_loja(url):
-    try:
-        dominio = urlparse(url).netloc.lower().replace("www.", "")
-        for chave, nome in LOJAS.items():
-            if chave in dominio:
-                return nome
-        partes = dominio.split(".")
-        return partes[-2].capitalize()
-    except:
-        return "Loja"
 
-# ──────────────────────────────────────────────
-# LIMPAR PREÇO (VERSÃO CORRIGIDA)
-# ──────────────────────────────────────────────
+    dominio = urlparse(url).netloc.lower()
+
+    for chave in LOJAS:
+        if chave in dominio:
+            return LOJAS[chave]
+
+    return dominio.replace("www.","")
+
+# ─────────────────────────────
+# LIMPAR PREÇO
+# ─────────────────────────────
+
 def limpar_preco(texto):
 
     if not texto:
@@ -94,84 +53,105 @@ def limpar_preco(texto):
 
     texto = str(texto)
 
-    texto = re.sub(r'(\d+\s*x)', '', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\d+\s*x', '', texto)
 
-    padroes = [
-        r'\d{1,3}(?:\.\d{3})*,\d{2}',
-        r'\d+\.\d{2}',
-        r'\d+,\d{2}'
-    ]
+    match = re.search(r'\d{1,3}(?:\.\d{3})*,\d{2}|\d+\.\d{2}', texto)
 
-    for padrao in padroes:
-        match = re.search(padrao, texto)
+    if not match:
+        return None
 
-        if match:
-            valor = match.group()
+    valor = match.group()
 
-            valor = valor.replace(".", "").replace(",", ".")
+    valor = valor.replace(".", "").replace(",", ".")
 
-            try:
-                return str(float(valor))
-            except:
-                continue
+    try:
+        return float(valor)
+    except:
+        return None
 
-    return None
-
-# ──────────────────────────────────────────────
+# ─────────────────────────────
 # FORMATAR PREÇO
-# ──────────────────────────────────────────────
+# ─────────────────────────────
+
 def formatar_preco(valor):
 
     if not valor:
         return None
 
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
+
+# ─────────────────────────────
+# DESCONTO
+# ─────────────────────────────
+
+def calcular_desconto(preco, antigo):
+
+    if not preco or not antigo:
+        return None
+
     try:
-        numero = float(valor)
 
-        return f"R$ {numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        desconto = 100 - (preco / antigo * 100)
+
+        return round(desconto)
+
     except:
-        return f"R$ {valor}"
+        return None
 
-# ──────────────────────────────────────────────
-# EXTRAIR PREÇOS
-# ──────────────────────────────────────────────
-def extrair_precos_schema(soup):
+# ─────────────────────────────
+# IMAGEM (CORRIGIDO AMAZON)
+# ─────────────────────────────
 
-    for script in soup.find_all("script", type="application/ld+json"):
+def extrair_imagem(soup):
 
-        try:
-            dados = json.loads(script.string or "")
+    og = soup.find("meta", {"property":"og:image"})
 
-            if isinstance(dados, list):
-                dados = next((d for d in dados if d.get("@type") == "Product"), {})
+    if og and og.get("content"):
+        return og["content"]
 
-            offers = dados.get("offers", {})
+    # Amazon fix
+    img = soup.select_one("#landingImage")
 
-            if isinstance(offers, list):
-                offers = offers[0]
+    if img and img.get("src"):
+        return img["src"]
 
-            preco = limpar_preco(str(offers.get("price")))
+    img = soup.select_one("img")
 
-            if preco:
-                return preco, None
+    if img:
+        return img.get("src")
 
-        except:
-            continue
+    return None
 
-    return None, None
+# ─────────────────────────────
+# PARCELAMENTO
+# ─────────────────────────────
 
-# ──────────────────────────────────────────────
-# EXTRAIR PREÇO HTML
-# ──────────────────────────────────────────────
-def extrair_precos_html(soup):
+def extrair_parcelamento(soup):
+
+    texto = soup.get_text(" ")
+
+    match = re.search(r'(\d{1,2})x\s*de\s*R?\$?\s*(\d+[,.]\d{2})', texto)
+
+    if match:
+        parcelas = match.group(1)
+        valor = match.group(2)
+
+        return f"{parcelas}x de R$ {valor}"
+
+    return None
+
+# ─────────────────────────────
+# PREÇO
+# ─────────────────────────────
+
+def extrair_preco(soup):
 
     seletores = [
-        "[itemprop='price']",
-        ".price",
-        ".preco",
-        ".sale-price",
+        "[itemprop=price]",
         ".a-offscreen",
-        ".andes-money-amount__fraction"
+        ".andes-money-amount__fraction",
+        ".price",
+        ".sale-price"
     ]
 
     for sel in seletores:
@@ -179,119 +159,149 @@ def extrair_precos_html(soup):
         el = soup.select_one(sel)
 
         if el:
+
             val = limpar_preco(el.get_text())
 
-            if val:
-                return val, None
-
-    return None, None
-
-# ──────────────────────────────────────────────
-# IMAGEM
-# ──────────────────────────────────────────────
-def extrair_imagem(soup):
-
-    og = soup.find("meta", {"property": "og:image"})
-
-    if og and og.get("content"):
-        return og["content"]
+            if val and val > 0:
+                return val
 
     return None
 
-# ──────────────────────────────────────────────
-# SCRAPING PRINCIPAL
-# ──────────────────────────────────────────────
+# ─────────────────────────────
+# PREÇO ANTIGO
+# ─────────────────────────────
+
+def extrair_preco_antigo(soup):
+
+    seletores = [
+        ".priceBlockStrikePriceString",
+        ".a-text-strike",
+        ".andes-money-amount--previous",
+        "s",
+        "del"
+    ]
+
+    for sel in seletores:
+
+        el = soup.select_one(sel)
+
+        if el:
+
+            val = limpar_preco(el.get_text())
+
+            if val:
+                return val
+
+    return None
+
+# ─────────────────────────────
+# SCRAPER
+# ─────────────────────────────
+
 def pegar_dados(link):
 
     titulo = "Produto"
+
     loja = nome_loja(link)
-    preco_atual = None
-    preco_antigo = None
+
+    preco = None
+    antigo = None
     imagem = None
+    parcelas = None
 
     try:
 
         r = scraper.get(link, headers=HEADERS, timeout=15)
 
-        url_final = r.url
-
-        loja = nome_loja(url_final)
-
         soup = BeautifulSoup(r.text, "html.parser")
 
-        og_title = soup.find("meta", {"property": "og:title"})
+        og = soup.find("meta", {"property":"og:title"})
 
-        if og_title and og_title.get("content"):
-            titulo = og_title["content"].strip()
+        if og:
+            titulo = og.get("content")
 
         elif soup.title:
-            titulo = soup.title.text.strip()
+            titulo = soup.title.text
 
-        preco_atual, preco_antigo = extrair_precos_schema(soup)
+        preco = extrair_preco(soup)
 
-        if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_html(soup)
+        antigo = extrair_preco_antigo(soup)
+
+        parcelas = extrair_parcelamento(soup)
 
         imagem = extrair_imagem(soup)
 
         print(f"""
-[DEBUG PRODUTO]
-
-Loja: {loja}
-Preço: {preco_atual}
-URL: {url_final}
-
+DEBUG
+titulo: {titulo}
+preco: {preco}
+antigo: {antigo}
+parcelas: {parcelas}
+imagem: {imagem}
 """)
 
     except Exception as e:
 
-        print(f"Erro scraping: {e}")
+        print("erro:", e)
 
-    return titulo, loja, preco_atual, preco_antigo, imagem
+    return titulo, loja, preco, antigo, parcelas, imagem
 
-# ──────────────────────────────────────────────
-# MENSAGEM
-# ──────────────────────────────────────────────
+# ─────────────────────────────
+# LINK
+# ─────────────────────────────
+
 def extrair_link(texto):
 
-    match = re.search(r'https?://[^\s]+', texto)
+    match = re.search(r'https?://\S+', texto)
 
     if match:
         return match.group()
 
     return None
 
+# ─────────────────────────────
+# MENSAGEM
+# ─────────────────────────────
 
-def escapar_html(texto):
+def montar_mensagem(link, titulo, loja, preco, antigo, parcelas):
 
-    return (
-        str(texto)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+    preco_f = formatar_preco(preco)
 
-def montar_mensagem(link, titulo, loja, preco_atual, preco_antigo):
+    antigo_f = formatar_preco(antigo)
 
-    preco = formatar_preco(preco_atual)
+    desconto = calcular_desconto(preco, antigo)
 
-    return (
-        f"🔥 PROMOÇÃO ENCONTRADA\n\n"
-        f"🛒 {escapar_html(titulo)}\n\n"
-        f"Loja: {escapar_html(loja)}\n\n"
-        f"Preço: {escapar_html(preco)}\n\n"
-        f"COMPRAR ⤵️\n"
-        f"{link}"
-    )
+    msg = "🔥 PROMOÇÃO ENCONTRADA\n\n"
 
-# ──────────────────────────────────────────────
+    msg += f"🛒 {titulo}\n\n"
+
+    msg += f"🏪 Loja: {loja}\n\n"
+
+    if antigo_f:
+        msg += f"❌ De: {antigo_f}\n"
+
+    if preco_f:
+        msg += f"💰 Por: {preco_f}\n"
+
+    if desconto:
+        msg += f"🔥 Desconto: {desconto}%\n"
+
+    if parcelas:
+        msg += f"💳 {parcelas}\n"
+
+    msg += f"\nCOMPRAR ⤵️\n{link}"
+
+    return msg
+
+# ─────────────────────────────
 # TELEGRAM
-# ──────────────────────────────────────────────
+# ─────────────────────────────
+
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     texto = update.message.text
 
-    if not texto or "http" not in texto:
+    if not texto:
         return
 
     link = extrair_link(texto)
@@ -299,59 +309,62 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not link:
         return
 
-    await update.message.reply_text("🔍 Buscando produto...")
+    await update.message.reply_text("🔎 Buscando produto...")
 
     loop = asyncio.get_event_loop()
 
-    titulo, loja, preco_atual, preco_antigo, imagem = await loop.run_in_executor(
-        None, pegar_dados, link
+    titulo, loja, preco, antigo, parcelas, imagem = await loop.run_in_executor(
+        None,
+        pegar_dados,
+        link
     )
 
-    mensagem = montar_mensagem(link, titulo, loja, preco_atual, preco_antigo)
+    mensagem = montar_mensagem(link, titulo, loja, preco, antigo, parcelas)
 
     if imagem:
+
         try:
+
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
                 photo=imagem,
-                caption=mensagem,
-                parse_mode="HTML"
+                caption=mensagem
             )
-            return
+
         except:
-            pass
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=mensagem,
-        parse_mode="HTML"
-    )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=mensagem
+            )
 
-# ──────────────────────────────────────────────
+    else:
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=mensagem
+        )
+
+# ─────────────────────────────
 # BOT
-# ──────────────────────────────────────────────
-async def main():
+# ─────────────────────────────
 
-    garantir_instancia_unica()
+async def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT, responder))
 
-    print("BOT PROMO INICIADO")
+    print("BOT PROMO RODANDO")
 
     await app.initialize()
+
     await app.start()
+
     await app.updater.start_polling()
 
     await asyncio.Event().wait()
 
-# ──────────────────────────────────────────────
-# START
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
 
-    try:
-        asyncio.run(main())
-    finally:
-        limpar_pid()
+    asyncio.run(main())
