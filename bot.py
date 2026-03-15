@@ -171,8 +171,7 @@ def extrair_precos_schema(soup):
                 if isinstance(offers, dict):
                     preco_atual = limpar_preco(str(offers.get("price", "")))
                     antigo_raw = (
-                        offers.get("highPrice")
-                        or offers.get("priceAnchor")
+                        offers.get("priceAnchor")
                         or offers.get("listPrice")
                     )
                     if antigo_raw:
@@ -180,7 +179,7 @@ def extrair_precos_schema(soup):
 
             elif tipo == "Offer":
                 preco_atual = limpar_preco(str(dados.get("price", "")))
-                antigo_raw = dados.get("highPrice") or dados.get("priceAnchor")
+                antigo_raw = dados.get("priceAnchor") or dados.get("listPrice")
                 if antigo_raw:
                     preco_antigo = limpar_preco(str(antigo_raw))
 
@@ -367,6 +366,10 @@ def pegar_dados(link):
             preco_atual, preco_antigo = extrair_precos_meta(soup)
         if not preco_atual:
             preco_atual, preco_antigo = extrair_precos_html(soup, url_final)
+        elif not preco_antigo:
+            # Preço atual encontrado via schema/meta, mas sem preço antigo:
+            # tenta extrair o preço riscado diretamente do HTML da página
+            _, preco_antigo = extrair_precos_html(soup, url_final)
 
         print(f"[DEBUG] Loja: {loja} | Preço: {preco_atual} | Antigo: {preco_antigo} | URL final: {url_final}")
 
