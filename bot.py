@@ -10,7 +10,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GRUPO_ID = os.environ.get("TELEGRAM_GRUPO_ID")
+
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN nao encontrado")
 
 scraper = cloudscraper.create_scraper()
 
@@ -28,7 +30,6 @@ LOJAS = {
     "mercadolivre": "Mercado Livre",
     "shopee": "Shopee",
     "magazineluiza": "Magazine Luiza",
-    "americanas": "Americanas",
     "kabum": "KaBuM"
 }
 
@@ -81,25 +82,7 @@ def formatar_preco(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
 
 # ─────────────────────────────
-# DESCONTO
-# ─────────────────────────────
-
-def calcular_desconto(preco, antigo):
-
-    if not preco or not antigo:
-        return None
-
-    try:
-
-        desconto = 100 - (preco / antigo * 100)
-
-        return round(desconto)
-
-    except:
-        return None
-
-# ─────────────────────────────
-# IMAGEM (CORRIGIDO AMAZON)
+# EXTRAIR IMAGEM
 # ─────────────────────────────
 
 def extrair_imagem(soup):
@@ -109,7 +92,6 @@ def extrair_imagem(soup):
     if og and og.get("content"):
         return og["content"]
 
-    # Amazon fix
     img = soup.select_one("#landingImage")
 
     if img and img.get("src"):
@@ -123,25 +105,7 @@ def extrair_imagem(soup):
     return None
 
 # ─────────────────────────────
-# PARCELAMENTO
-# ─────────────────────────────
-
-def extrair_parcelamento(soup):
-
-    texto = soup.get_text(" ")
-
-    match = re.search(r'(\d{1,2})x\s*de\s*R?\$?\s*(\d+[,.]\d{2})', texto)
-
-    if match:
-        parcelas = match.group(1)
-        valor = match.group(2)
-
-        return f"{parcelas}x de R$ {valor}"
-
-    return None
-
-# ─────────────────────────────
-# PREÇO
+# EXTRAIR PREÇO
 # ─────────────────────────────
 
 def extrair_preco(soup):
@@ -168,46 +132,15 @@ def extrair_preco(soup):
     return None
 
 # ─────────────────────────────
-# PREÇO ANTIGO
-# ─────────────────────────────
-
-def extrair_preco_antigo(soup):
-
-    seletores = [
-        ".priceBlockStrikePriceString",
-        ".a-text-strike",
-        ".andes-money-amount--previous",
-        "s",
-        "del"
-    ]
-
-    for sel in seletores:
-
-        el = soup.select_one(sel)
-
-        if el:
-
-            val = limpar_preco(el.get_text())
-
-            if val:
-                return val
-
-    return None
-
-# ─────────────────────────────
 # SCRAPER
 # ─────────────────────────────
 
 def pegar_dados(link):
 
     titulo = "Produto"
-
     loja = nome_loja(link)
-
     preco = None
-    antigo = None
     imagem = None
-    parcelas = None
 
     try:
 
@@ -225,18 +158,12 @@ def pegar_dados(link):
 
         preco = extrair_preco(soup)
 
-        antigo = extrair_preco_antigo(soup)
-
-        parcelas = extrair_parcelamento(soup)
-
         imagem = extrair_imagem(soup)
 
         print(f"""
 DEBUG
 titulo: {titulo}
 preco: {preco}
-antigo: {antigo}
-parcelas: {parcelas}
 imagem: {imagem}
 """)
 
@@ -244,7 +171,7 @@ imagem: {imagem}
 
         print("erro:", e)
 
-    return titulo, loja, preco, antigo, parcelas, imagem
+    return titulo, loja, preco, imagem
 
 # ─────────────────────────────
 # LINK
@@ -263,13 +190,9 @@ def extrair_link(texto):
 # MENSAGEM
 # ─────────────────────────────
 
-def montar_mensagem(link, titulo, loja, preco, antigo, parcelas):
+def montar_mensagem(link, titulo, loja, preco):
 
     preco_f = formatar_preco(preco)
-
-    antigo_f = formatar_preco(antigo)
-
-    desconto = calcular_desconto(preco, antigo)
 
     msg = "🔥 PROMOÇÃO ENCONTRADA\n\n"
 
@@ -277,17 +200,8 @@ def montar_mensagem(link, titulo, loja, preco, antigo, parcelas):
 
     msg += f"🏪 Loja: {loja}\n\n"
 
-    if antigo_f:
-        msg += f"❌ De: {antigo_f}\n"
-
     if preco_f:
-        msg += f"💰 Por: {preco_f}\n"
-
-    if desconto:
-        msg += f"🔥 Desconto: {desconto}%\n"
-
-    if parcelas:
-        msg += f"💳 {parcelas}\n"
+        msg += f"💰 Preço: {preco_f}\n"
 
     msg += f"\nCOMPRAR ⤵️\n{link}"
 
@@ -311,15 +225,15 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔎 Buscando produto...")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    titulo, loja, preco, antigo, parcelas, imagem = await loop.run_in_executor(
+    titulo, loja, preco, imagem = await loop.run_in_executor(
         None,
         pegar_dados,
         link
     )
 
-    mensagem = montar_mensagem(link, titulo, loja, preco, antigo, parcelas)
+    mensagem = montar_mensagem(link, titulo, loja, preco)
 
     if imagem:
 
@@ -331,25 +245,21 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption=mensagem
             )
 
+            return
+
         except:
+            pass
 
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=mensagem
-            )
-
-    else:
-
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=mensagem
-        )
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=mensagem
+    )
 
 # ─────────────────────────────
 # BOT
 # ─────────────────────────────
 
-async def main():
+def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -357,14 +267,7 @@ async def main():
 
     print("BOT PROMO RODANDO")
 
-    await app.initialize()
-
-    await app.start()
-
-    await app.updater.start_polling()
-
-    await asyncio.Event().wait()
+    app.run_polling()
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    main()
