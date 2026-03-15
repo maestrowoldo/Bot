@@ -23,6 +23,9 @@ if not TOKEN:
 if not GRUPO_ID:
     raise ValueError("TELEGRAM_GRUPO_ID nao encontrado.")
 
+# ──────────────────────────────────────────────
+# Instância única via PID file
+# ──────────────────────────────────────────────
 PID_FILE = "/tmp/mypromo_bot.pid"
 
 def garantir_instancia_unica():
@@ -45,220 +48,401 @@ def limpar_pid():
         pass
 
 # ──────────────────────────────────────────────
-# Mapeamento e Headers
+# Mapeamento de lojas (incluindo URLs curtas)
 # ──────────────────────────────────────────────
 LOJAS = {
+    # Mercado Livre — domínios completos e URLs curtas
     "mercadolivre.com.br": "Mercado Livre",
     "mercadolibre.com":    "Mercado Livre",
     "meli.com":            "Mercado Livre",
-    "meli.la":             "Mercado Livre",
+    "mlv.io":              "Mercado Livre",
+    "ml.com.br":           "Mercado Livre",
+    # Amazon — domínios completos e URLs curtas
     "amazon.com.br":       "Amazon",
+    "amazon.com":          "Amazon",
     "amzn.to":             "Amazon",
+    "amzn.com":            "Amazon",
+    "a.co":                "Amazon",
+    # Demais lojas
+    "americanas.com.br":   "Americanas",
+    "magazineluiza.com.br":"Magazine Luiza",
     "magalu.com.br":       "Magazine Luiza",
     "shopee.com.br":       "Shopee",
+    "casasbahia.com.br":   "Casas Bahia",
+    "submarino.com.br":    "Submarino",
+    "extra.com.br":        "Extra",
+    "pontofrio.com.br":    "Ponto Frio",
+    "fastshop.com.br":     "Fast Shop",
+    "kabum.com.br":        "KaBuM!",
+    "aliexpress.com":      "AliExpress",
+    "shein.com":           "Shein",
+    "netshoes.com.br":     "Netshoes",
+    "centauro.com.br":     "Centauro",
+    "leroymerlin.com.br":  "Leroy Merlin",
+    "carrefour.com.br":    "Carrefour",
+    "havan.com.br":        "Havan",
+    "renner.com.br":       "Renner",
+    "riachuelo.com.br":    "Riachuelo",
+    "dafiti.com.br":       "Dafiti",
+    "zattini.com.br":      "Zattini",
+    "nike.com.br":         "Nike",
+    "adidas.com.br":       "Adidas",
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # ──────────────────────────────────────────────
-# Utilitários de Limpeza
+# Utilitários de preço
 # ──────────────────────────────────────────────
-def limpar_preco(texto):
-    if not texto: return None
-    # Remove tudo que não é dígito, vírgula ou ponto
-    texto = re.sub(r'[^\d.,]', '', str(texto).strip())
-    
-    # Caso especial: "1.299,00" -> "1299.00"
-    if ',' in texto and '.' in texto:
-        if texto.rfind(',') > texto.rfind('.'):
-            texto = texto.replace('.', '').replace(',', '.')
-        else:
-            texto = texto.replace(',', '')
-    # Caso: "1299,00" -> "1299.00"
-    elif ',' in texto:
-        texto = texto.replace(',', '.')
-        
+def nome_loja(url):
     try:
-        return str(float(texto))
-    except:
+        dominio = urlparse(url).netloc.lower().replace("www.", "")
+        for chave, nome in LOJAS.items():
+            if chave in dominio:
+                return nome
+        partes = dominio.split(".")
+        return partes[-2].capitalize() if len(partes) >= 2 else dominio.capitalize()
+    except Exception:
+        return "Loja"
+
+
+def limpar_preco(texto):
+    if not texto:
+        return None
+    texto = str(texto).strip()
+    # Aceita padrões como 1.299,99 ou 1299.99 ou 299,90
+    match = re.search(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+[.,]\d{2}|\d+)', texto)
+    if not match:
+        return None
+    valor = match.group()
+    # Normaliza para ponto decimal
+    if re.search(r',\d{2}$', valor):
+        valor = valor.replace(".", "").replace(",", ".")
+    elif re.search(r'\.\d{2}$', valor):
+        valor = valor.replace(",", "")
+    try:
+        float(valor)
+        return valor
+    except ValueError:
         return None
 
+
 def formatar_preco(valor):
-    if not valor: return None
+    if not valor:
+        return None
     try:
-        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except:
+        numero = float(valor)
+        return f"R$ {numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
         return f"R$ {valor}"
 
+
 # ──────────────────────────────────────────────
-# Lógica de Extração Refinada
+# Extração de preços
 # ──────────────────────────────────────────────
-def extrair_dados_especificos(soup, url):
+def extrair_precos_schema(soup):
+    preco_atual = None
+    preco_antigo = None
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            dados = json.loads(script.string or "")
+            if isinstance(dados, list):
+                dados = next((d for d in dados if d.get("@type") in ("Product", "Offer")), {})
+            tipo = dados.get("@type", "")
+            if tipo == "Product":
+                offers = dados.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0]
+                preco_atual = limpar_preco(str(offers.get("price", "")))
+                preco_antigo = limpar_preco(str(offers.get("highPrice", "") or offers.get("priceAnchor", "")))
+            elif tipo == "Offer":
+                preco_atual = limpar_preco(str(dados.get("price", "")))
+                preco_antigo = limpar_preco(str(dados.get("highPrice", "")))
+            if preco_atual:
+                break
+        except Exception:
+            continue
+    return preco_atual, preco_antigo
+
+
+def extrair_precos_meta(soup):
+    for prop in ["product:price:amount", "og:price:amount"]:
+        meta = soup.find("meta", {"property": prop})
+        if meta and meta.get("content"):
+            return limpar_preco(meta["content"]), None
+    meta = soup.find("meta", {"itemprop": "price"})
+    if meta and meta.get("content"):
+        return limpar_preco(meta["content"]), None
+    return None, None
+
+
+def extrair_precos_html(soup, url):
     dominio = urlparse(url).netloc.lower()
+
+    seletores_atual = [
+        "[itemprop='price']",
+        ".price", ".preco", ".sale-price", ".offer-price",
+        ".product-price", ".product__price",
+    ]
+    seletores_antigo = [
+        ".old-price", ".price-before", ".was-price",
+        ".preco-antigo", ".price__old", "s", "del", "strike",
+    ]
+
+    mapa_lojas = {
+        "mercadolivre": (
+            [".andes-money-amount__fraction", ".price-tag-fraction",
+             ".ui-pdp-price__second-line .andes-money-amount__fraction"],
+            [".andes-money-amount--previous .andes-money-amount__fraction",
+             ".price-tag--del .price-tag-fraction"],
+        ),
+        "amazon": (
+            [".a-price .a-offscreen", ".priceToPay .a-offscreen",
+             "#priceblock_ourprice", "#priceblock_dealprice"],
+            [".a-text-strike .a-offscreen", "#listPrice",
+             ".a-price.a-text-price .a-offscreen"],
+        ),
+        "magazineluiza": (
+            ["[data-testid='price-value']", ".price__current", ".sc-ckVGcZ"],
+            ["[data-testid='original-price']", ".price__original"],
+        ),
+        "americanas": (
+            ["[data-testid='price']", ".priceSales"],
+            ["[data-testid='list-price']", ".priceStandard"],
+        ),
+        "casasbahia": (
+            ["[data-testid='price-value']", ".price__current--value"],
+            ["[data-testid='original-price']", ".price__old--value"],
+        ),
+        "kabum": (
+            ["[itemprop='price']", ".regularPrice", ".finalPrice"],
+            [".oldPrice", ".oldPriceValue"],
+        ),
+    }
+
+    for chave, (s_atual, s_antigo) in mapa_lojas.items():
+        if chave in dominio:
+            seletores_atual = s_atual + seletores_atual
+            seletores_antigo = s_antigo + seletores_antigo
+            break
+
+    preco_atual = None
+    for sel in seletores_atual:
+        el = soup.select_one(sel)
+        if el:
+            val = limpar_preco(el.get_text(" ", strip=True))
+            if val and float(val) > 0:
+                preco_atual = val
+                break
+
+    preco_antigo = None
+    for sel in seletores_antigo:
+        el = soup.select_one(sel)
+        if el:
+            candidato = limpar_preco(el.get_text(" ", strip=True))
+            if candidato and candidato != preco_atual:
+                preco_antigo = candidato
+                break
+
+    return preco_atual, preco_antigo
+
+
+# ──────────────────────────────────────────────
+# Extração de imagem
+# ──────────────────────────────────────────────
+def extrair_imagem(soup):
+    og = soup.find("meta", {"property": "og:image"})
+    if og and og.get("content"):
+        return og["content"]
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            dados = json.loads(script.string or "")
+            if isinstance(dados, list):
+                dados = next((d for d in dados if d.get("@type") == "Product"), {})
+            imagem = dados.get("image")
+            if isinstance(imagem, list):
+                imagem = imagem[0]
+            if isinstance(imagem, dict):
+                imagem = imagem.get("url")
+            if imagem:
+                return imagem
+        except Exception:
+            continue
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or ""
+        if src.startswith("http") and not src.endswith(".svg"):
+            return src
+    return None
+
+
+# ──────────────────────────────────────────────
+# Função principal de scraping
+# ──────────────────────────────────────────────
+def pegar_dados(link):
+    titulo = "Produto"
+    loja = nome_loja(link)  # nome pela URL curta
     preco_atual = None
     preco_antigo = None
     imagem = None
 
-    # --- MERCADO LIVRE ---
-    if "mercadolivre" in dominio or "mercadolibre" in dominio:
-        # Preço Atual (ML separa fração e centavos)
-        meta_price = soup.find("meta", {"itemprop": "price"})
-        if meta_price:
-            preco_atual = limpar_preco(meta_price.get("content"))
-        
-        if not preco_atual:
-            container = soup.select_one(".ui-pdp-price__second-line .andes-money-amount__fraction")
-            if container: preco_atual = limpar_preco(container.text)
-
-        # Preço Antigo
-        del_tag = soup.select_one(".ui-pdp-price__old .andes-money-amount__fraction")
-        if del_tag:
-            preco_antigo = limpar_preco(del_tag.text)
-
-    # --- AMAZON ---
-    elif "amazon" in dominio or "amzn" in dominio:
-        # Preço Atual
-        # A Amazon costuma usar a-offscreen para o valor puro
-        p_element = soup.select_one(".priceToPay .a-offscreen") or soup.select_one(".a-price .a-offscreen")
-        if p_element:
-            preco_atual = limpar_preco(p_element.text)
-        
-        # Preço Antigo
-        old_p = soup.select_one(".basisPrice .a-offscreen") or soup.select_one(".a-text-strike")
-        if old_p:
-            preco_antigo = limpar_preco(old_p.text)
-
-        # Imagem Amazon (Específica)
-        img_el = soup.select_one("#landingImage") or soup.select_one("#main-image") or soup.select_one(".a-dynamic-image")
-        if img_el:
-            # Pega o atributo data-old-hires ou a maior imagem do data-a-dynamic-image
-            if img_el.get("data-old-hires"):
-                imagem = img_el.get("data-old-hires")
-            elif img_el.get("data-a-dynamic-image"):
-                try:
-                    imgs_dict = json.loads(img_el.get("data-a-dynamic-image"))
-                    imagem = list(imgs_dict.keys())[-1] # Pega a de maior resolução
-                except: pass
-            if not imagem:
-                imagem = img_el.get("src")
-
-    # --- FALLBACK GERAL (Schema.org) ---
-    if not preco_atual:
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, list): data = data[0]
-                if data.get("@type") == "Product":
-                    offers = data.get("offers", {})
-                    if isinstance(offers, list): offers = offers[0]
-                    preco_atual = limpar_preco(offers.get("price"))
-                    break
-            except: continue
-
-    # Imagem Fallback
-    if not imagem:
-        og_img = soup.find("meta", {"property": "og:image"})
-        imagem = og_img.get("content") if og_img else None
-
-    return preco_atual, preco_antigo, imagem
-
-# ──────────────────────────────────────────────
-# Scraping Principal
-# ──────────────────────────────────────────────
-def pegar_dados(link):
-    titulo = "Produto"
-    loja = "Loja"
-    
     try:
-        # User agent rotativo ou fixo robusto para evitar block
-        session = requests.Session()
-        r = session.get(link, headers=HEADERS, timeout=15, allow_redirects=True)
-        url_final = r.url
-        
-        # Identificar Loja
-        dominio = urlparse(url_final).netloc.lower().replace("www.", "")
-        for k, v in LOJAS.items():
-            if k in dominio:
-                loja = v
-                break
-        
+        r = requests.get(link, headers=HEADERS, timeout=12, allow_redirects=True)
+        r.raise_for_status()
+        url_final = r.url  # URL após redirecionamentos (ex: amzn.to → amazon.com.br)
+        loja = nome_loja(url_final)  # re-detecta pela URL final
+
         soup = BeautifulSoup(r.text, "html.parser")
-        
+
         # Título
-        title_tag = soup.find("meta", {"property": "og:title"}) or soup.find("title")
-        if title_tag:
-            titulo = title_tag.get("content", title_tag.text).strip()
-            if "Amazon.com.br" in titulo: titulo = titulo.replace(": Amazon.com.br", "")
+        og_title = soup.find("meta", {"property": "og:title"})
+        if og_title and og_title.get("content"):
+            titulo = og_title["content"].strip()
+        elif soup.title:
+            titulo = soup.title.text.strip()
 
-        # Extração de Preços e Imagem
-        preco_atual, preco_antigo, imagem = extrair_dados_especificos(soup, url_final)
+        # Preços: schema.org → meta tags → HTML
+        preco_atual, preco_antigo = extrair_precos_schema(soup)
+        if not preco_atual:
+            preco_atual, preco_antigo = extrair_precos_meta(soup)
+        if not preco_atual:
+            preco_atual, preco_antigo = extrair_precos_html(soup, url_final)
 
-        # Log para Debug
-        print(f"[DEBUG] {loja} | Atual: {preco_atual} | Antigo: {preco_antigo} | Img: {bool(imagem)}")
+        print(f"[DEBUG] Loja: {loja} | Preço: {preco_atual} | Antigo: {preco_antigo} | URL final: {url_final}")
 
-        return titulo, loja, preco_atual, preco_antigo, imagem
+        # Imagem
+        imagem = extrair_imagem(soup)
 
     except Exception as e:
-        print(f"[ERRO] Scraping {link}: {e}")
-        return "Produto", "Loja", None, None, None
+        print(f"[ERRO] {link}: {e}")
+
+    return titulo, loja, preco_atual, preco_antigo, imagem
+
 
 # ──────────────────────────────────────────────
-# Handlers e Bot
+# Montagem da mensagem
+# ──────────────────────────────────────────────
+def extrair_link(texto):
+    match = re.search(r'https?://[^\s]+', texto)
+    return match.group() if match else None
+
+
+def escapar_html(texto):
+    return (
+        str(texto)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def montar_mensagem(link, titulo, loja, preco_atual, preco_antigo):
+    preco_atual_fmt = formatar_preco(preco_atual)
+    preco_antigo_fmt = formatar_preco(preco_antigo)
+
+    if preco_atual_fmt and preco_antigo_fmt:
+        linha_preco = (
+            f"<s>De: {escapar_html(preco_antigo_fmt)}</s>\n"
+            f"Por: {escapar_html(preco_atual_fmt)}"
+        )
+    elif preco_atual_fmt:
+        linha_preco = f"Por: {escapar_html(preco_atual_fmt)}"
+    else:
+        linha_preco = "Ver preço no link"
+
+    return (
+        f"🔥 PROMOÇÃO ENCONTRADA\n\n"
+        f"🛒 {escapar_html(titulo)}\n\n"
+        f"Loja: {escapar_html(loja)}\n\n"
+        f"{linha_preco}\n\n"
+        f"COMPRAR AGORA ⤵️\n"
+        f"{escapar_html(link)}\n\n"
+        f"⚡ Oferta pode acabar a qualquer momento"
+    )
+
+
+# ──────────────────────────────────────────────
+# Handler do Telegram
 # ──────────────────────────────────────────────
 async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    
-    match = re.search(r'https?://[^\s]+', update.message.text)
-    if not match: return
-    
-    link = match.group()
-    msg_status = await update.message.reply_text("⏳ Analisando link...")
+    texto = update.message.text
+    if not texto or "http" not in texto:
+        return
+
+    link = extrair_link(texto)
+    if not link:
+        return
+
+    await update.message.reply_text("🔍 Buscando informações do produto...")
 
     loop = asyncio.get_event_loop()
-    titulo, loja, preco_atual, preco_antigo, imagem = await loop.run_in_executor(None, pegar_dados, link)
+    titulo, loja, preco_atual, preco_antigo, imagem = await loop.run_in_executor(
+        None, pegar_dados, link
+    )
+    mensagem = montar_mensagem(link, titulo, loja, preco_atual, preco_antigo)
 
-    # Formatação Final
-    preco_f = formatar_preco(preco_atual)
-    preco_o = formatar_preco(preco_antigo)
-    
-    texto_promo = f"🔥 <b>{titulo}</b>\n\n"
-    texto_promo += f"🛒 Loja: <b>{loja}</b>\n"
-    if preco_o and preco_f:
-        texto_promo += f"<s>De: {preco_o}</s>\n"
-        texto_promo += f"✅ <b>Por: {preco_f}</b>\n"
-    elif preco_f:
-        texto_promo += f"✅ <b>Preço: {preco_f}</b>\n"
-    else:
-        texto_promo += "⚠️ Confira o preço no site\n"
-        
-    texto_promo += f"\n🔗 <a href='{link}'>Clique aqui para comprar</a>"
-
-    try:
-        # Enviar para o Grupo e apagar msg de status
+    async def enviar(chat_id):
         if imagem:
-            await context.bot.send_photo(chat_id=GRUPO_ID, photo=imagem, caption=texto_promo, parse_mode="HTML")
-            await update.message.reply_photo(photo=imagem, caption=texto_promo, parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=GRUPO_ID, text=texto_promo, parse_mode="HTML", disable_web_page_preview=False)
-            await update.message.reply_text(texto_promo, parse_mode="HTML")
-            
-        await msg_status.delete()
-    except Exception as e:
-        await msg_status.edit_text(f"❌ Erro ao postar: {e}")
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=imagem,
+                    caption=mensagem, parse_mode="HTML"
+                )
+                return
+            except Exception:
+                pass
+        await context.bot.send_message(chat_id=chat_id, text=mensagem, parse_mode="HTML")
 
+    await enviar(update.effective_chat.id)
+    try:
+        await enviar(GRUPO_ID)
+    except Exception as e:
+        print(f"[ERRO] Grupo: {e}")
+
+
+# ──────────────────────────────────────────────
+# Inicialização
+# ──────────────────────────────────────────────
 async def main():
     garantir_instancia_unica()
+
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), responder))
-    
-    print("Bot rodando...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()
+    app.add_handler(MessageHandler(filters.TEXT, responder))
+
+    print("Bot mypromo iniciado! Aguardando mensagens...")
+
+    while True:
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            await asyncio.Event().wait()
+        except Conflict:
+            print("Conflito 409. Aguardando 6s...")
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(6)
+        except Exception as e:
+            print(f"Erro: {e}. Reiniciando em 3s...")
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
 
 if __name__ == "__main__":
     try:
