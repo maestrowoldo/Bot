@@ -334,24 +334,36 @@ def extrair_link(texto):
     return match.group() if match else None
 
 
+def escapar_html(texto):
+    return (
+        str(texto)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 def montar_mensagem(link, titulo, loja, preco_atual, preco_antigo):
     preco_atual_fmt = formatar_preco(preco_atual)
     preco_antigo_fmt = formatar_preco(preco_antigo)
 
     if preco_atual_fmt and preco_antigo_fmt:
-        linha_preco = f"🏷️ De: {preco_antigo_fmt}\n💰 Por: {preco_atual_fmt}"
+        linha_preco = (
+            f"<s>De: {escapar_html(preco_antigo_fmt)}</s>\n"
+            f"Por: {escapar_html(preco_atual_fmt)}"
+        )
     elif preco_atual_fmt:
-        linha_preco = f"💰 Preço: {preco_atual_fmt}"
+        linha_preco = f"Por: {escapar_html(preco_atual_fmt)}"
     else:
-        linha_preco = "💰 Ver preço no link"
+        linha_preco = "Ver preço no link"
 
     return (
         f"🔥 PROMOÇÃO ENCONTRADA\n\n"
-        f"🛒 {titulo}\n\n"
-        f"🏪 Loja: {loja}\n"
+        f"🛒 {escapar_html(titulo)}\n\n"
+        f"Loja: {escapar_html(loja)}\n\n"
         f"{linha_preco}\n\n"
-        f"🚚 Pode ter frete grátis\n\n"
-        f"👉 COMPRAR AGORA\n{link}\n\n"
+        f"COMPRAR AGORA ⤵️\n"
+        f"{escapar_html(link)}\n\n"
         f"⚡ Oferta pode acabar a qualquer momento"
     )
 
@@ -379,11 +391,14 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def enviar(chat_id):
         if imagem:
             try:
-                await context.bot.send_photo(chat_id=chat_id, photo=imagem, caption=mensagem)
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=imagem,
+                    caption=mensagem, parse_mode="HTML"
+                )
                 return
             except Exception:
                 pass
-        await context.bot.send_message(chat_id=chat_id, text=mensagem)
+        await context.bot.send_message(chat_id=chat_id, text=mensagem, parse_mode="HTML")
 
     await enviar(update.effective_chat.id)
     try:
