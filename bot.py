@@ -55,6 +55,7 @@ LOJAS = {
     "mercadolivre.com.br": "Mercado Livre",
     "mercadolibre.com":    "Mercado Livre",
     "meli.com":            "Mercado Livre",
+    "meli.la":             "Mercado Livre",
     "mlv.io":              "Mercado Livre",
     "ml.com.br":           "Mercado Livre",
     # Amazon — domínios completos e URLs curtas
@@ -154,18 +155,43 @@ def extrair_precos_schema(soup):
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             dados = json.loads(script.string or "")
+            # Pode ser lista de objetos
             if isinstance(dados, list):
-                dados = next((d for d in dados if d.get("@type") in ("Product", "Offer")), {})
+                obj = next((d for d in dados if d.get("@type") == "Product"), None)
+                if obj is None:
+                    obj = next((d for d in dados if d.get("@type") == "Offer"), None)
+                dados = obj or {}
+
             tipo = dados.get("@type", "")
+
             if tipo == "Product":
                 offers = dados.get("offers", {})
                 if isinstance(offers, list):
-                    offers = offers[0]
-                preco_atual = limpar_preco(str(offers.get("price", "")))
-                preco_antigo = limpar_preco(str(offers.get("highPrice", "") or offers.get("priceAnchor", "")))
+                    offers = offers[0] if offers else {}
+                if isinstance(offers, dict):
+                    preco_atual = limpar_preco(str(offers.get("price", "")))
+                    antigo_raw = (
+                        offers.get("highPrice")
+                        or offers.get("priceAnchor")
+                        or offers.get("listPrice")
+                    )
+                    if antigo_raw:
+                        preco_antigo = limpar_preco(str(antigo_raw))
+
             elif tipo == "Offer":
                 preco_atual = limpar_preco(str(dados.get("price", "")))
-                preco_antigo = limpar_preco(str(dados.get("highPrice", "")))
+                antigo_raw = dados.get("highPrice") or dados.get("priceAnchor")
+                if antigo_raw:
+                    preco_antigo = limpar_preco(str(antigo_raw))
+
+            # Garante que antigo > atual (senão descarta)
+            if preco_atual and preco_antigo:
+                try:
+                    if float(preco_antigo) <= float(preco_atual):
+                        preco_antigo = None
+                except (ValueError, TypeError):
+                    preco_antigo = None
+
             if preco_atual:
                 break
         except Exception:
@@ -201,7 +227,7 @@ def extrair_precos_html(soup, url):
         "mercadolivre": (
             [".andes-money-amount__fraction", ".price-tag-fraction",
              ".ui-pdp-price__second-line .andes-money-amount__fraction"],
-            [".andes-money-amount--previous .andes-money-amount__fraction",
+            ["s.andes-money-amount--previous", ".andes-money-amount--previous",
              ".price-tag--del .price-tag-fraction"],
         ),
         "amazon": (
@@ -244,11 +270,38 @@ def extrair_precos_html(soup, url):
                 break
 
     preco_antigo = None
+
+    # 1. Tenta via seletores CSS específicos
     for sel in seletores_antigo:
         el = soup.select_one(sel)
         if el:
             candidato = limpar_preco(el.get_text(" ", strip=True))
             if candidato and candidato != preco_atual:
+                preco_antigo = candidato
+                break
+
+    # 2. ML específico: aria-label="Antes: X reais" ou "Era: X"
+    if not preco_antigo and "mercadolivre" in dominio:
+        for el in soup.find_all(attrs={"aria-label": True}):
+            label = el["aria-label"]
+            if re.search(r'(Antes|Era|anterior)[:\s]', label, re.IGNORECASE):
+                candidato = limpar_preco(label)
+                if candidato and candidato != preco_atual:
+                    preco_antigo = candidato
+                    break
+
+    # 3. Fallback genérico: qualquer <s> ou <del> com preço maior que o atual
+    if not preco_antigo:
+        for tag in soup.find_all(["s", "del"]):
+            candidato = limpar_preco(tag.get_text(" ", strip=True))
+            if not candidato:
+                continue
+            try:
+                if preco_atual and float(candidato) <= float(preco_atual):
+                    continue  # ignora se for menor ou igual (não faz sentido como "De")
+            except (ValueError, TypeError):
+                pass
+            if candidato != preco_atual:
                 preco_antigo = candidato
                 break
 
