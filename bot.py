@@ -1,17 +1,23 @@
-import telebot
 import os
 import re
 import json
 import time
+import asyncio
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
+from telegram import Update
+from telegram.error import Conflict
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GRUPO_ID = os.environ.get("TELEGRAM_GRUPO_ID")
+
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN nao encontrado nas variaveis de ambiente.")
-
-bot = telebot.TeleBot(TOKEN)
+if not GRUPO_ID:
+    raise ValueError("TELEGRAM_GRUPO_ID nao encontrado nas variaveis de ambiente.")
 
 HEADERS = {
     "User-Agent": (
@@ -41,7 +47,6 @@ LOJAS = {
     "shein.com": "Shein",
     "netshoes.com.br": "Netshoes",
     "centauro.com.br": "Centauro",
-    "leroy.com.br": "Leroy Merlin",
     "leroymerlin.com.br": "Leroy Merlin",
     "carrefour.com.br": "Carrefour",
     "havan.com.br": "Havan",
@@ -72,13 +77,13 @@ def limpar_preco(texto):
     if not texto:
         return None
     texto = texto.strip()
-    texto = re.sub(r"[^\d,\.]", "", texto)
-    if not texto:
+    match = re.search(r'\d[\d.,]*', texto)
+    if not match:
         return None
-    texto = texto.replace(",", ".")
+    valor = match.group().replace(",", ".")
     try:
-        float(texto)
-        return texto
+        float(valor)
+        return valor
     except ValueError:
         return None
 
@@ -94,16 +99,13 @@ def formatar_preco(valor):
 
 
 def extrair_precos_schema(soup):
-    """Tenta extrair preços via JSON-LD (schema.org) — mais confiável."""
     preco_atual = None
     preco_antigo = None
-
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             dados = json.loads(script.string or "")
             if isinstance(dados, list):
                 dados = next((d for d in dados if d.get("@type") in ("Product", "Offer")), {})
-
             tipo = dados.get("@type", "")
             if tipo == "Product":
                 offers = dados.get("offers", {})
@@ -114,22 +116,18 @@ def extrair_precos_schema(soup):
             elif tipo == "Offer":
                 preco_atual = limpar_preco(str(dados.get("price", "")))
                 preco_antigo = limpar_preco(str(dados.get("highPrice", "")))
-
             if preco_atual:
                 break
         except Exception:
             continue
-
     return preco_atual, preco_antigo
 
 
 def extrair_precos_html(soup, url):
-    """Tenta extrair preços via seletores CSS específicos por loja e genéricos."""
     dominio = urlparse(url).netloc.lower()
     preco_atual = None
     preco_antigo = None
 
-    # Seletores específicos por loja: (seletor_atual, seletor_antigo)
     mapa_lojas = {
         "mercadolivre": (
             [".andes-money-amount__fraction", ".price-tag-fraction"],
@@ -140,16 +138,12 @@ def extrair_precos_html(soup, url):
             [".a-text-strike .a-offscreen", "#listPrice", ".a-price.a-text-price .a-offscreen"],
         ),
         "magazineluiza": (
-            ["[data-testid='price-value']", ".price__current", ".sc-ckVGcZ"],
-            ["[data-testid='original-price']", ".price__original", ".sc-bdVTJa"],
+            ["[data-testid='price-value']", ".price__current"],
+            ["[data-testid='original-price']", ".price__original"],
         ),
         "americanas": (
-            ["[data-testid='price']", ".priceSales", ".sales-price"],
-            ["[data-testid='list-price']", ".priceStandard", ".list-price"],
-        ),
-        "shopee": (
-            [".pmmxKx", "._3n5NQx", ".price"],
-            [".WTFwws", "._1FGCO7", ".price--original"],
+            ["[data-testid='price']", ".priceSales"],
+            ["[data-testid='list-price']", ".priceStandard"],
         ),
         "casasbahia": (
             [".price__current--value", "[data-testid='price-value']"],
@@ -162,7 +156,7 @@ def extrair_precos_html(soup, url):
     }
 
     seletores_atual = [".price", ".preco", "[itemprop='price']", ".sale-price", ".offer-price"]
-    seletores_antigo = [".old-price", ".preco-antigo", ".price-before", ".de", ".was-price", "s", "del", ".strike"]
+    seletores_antigo = [".old-price", ".preco-antigo", ".price-before", ".was-price", "s", "del"]
 
     for chave, (s_atual, s_antigo) in mapa_lojas.items():
         if chave in dominio:
@@ -180,8 +174,7 @@ def extrair_precos_html(soup, url):
     for sel in seletores_antigo:
         el = soup.select_one(sel)
         if el:
-            texto = el.get_text()
-            candidato = limpar_preco(texto)
+            candidato = limpar_preco(el.get_text())
             if candidato and candidato != preco_atual:
                 preco_antigo = candidato
                 break
@@ -189,99 +182,184 @@ def extrair_precos_html(soup, url):
     return preco_atual, preco_antigo
 
 
-def extrair_precos_meta(soup):
-    """Tenta extrair preço via meta tags Open Graph / itemprop."""
-    preco_atual = None
+def extrair_imagem(soup, url):
+    """Tenta pegar a melhor imagem do produto."""
+    # Open Graph (mais confiável)
+    og = soup.find("meta", {"property": "og:image"})
+    if og and og.get("content"):
+        return og["content"]
 
-    meta = soup.find("meta", {"property": "product:price:amount"}) or \
-           soup.find("meta", {"itemprop": "price"}) or \
-           soup.find("meta", {"property": "og:price:amount"})
+    # Schema.org
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            dados = json.loads(script.string or "")
+            if isinstance(dados, list):
+                dados = next((d for d in dados if d.get("@type") == "Product"), {})
+            imagem = dados.get("image")
+            if isinstance(imagem, list):
+                imagem = imagem[0]
+            if isinstance(imagem, dict):
+                imagem = imagem.get("url")
+            if imagem:
+                return imagem
+        except Exception:
+            continue
 
-    if meta:
-        preco_atual = limpar_preco(meta.get("content", ""))
+    # Primeira imagem grande da página
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or ""
+        if src and src.startswith("http") and not src.endswith(".svg"):
+            return src
 
-    return preco_atual, None
+    return None
 
 
-def buscar_info_link(url):
-    """Busca nome da loja e preços a partir do link."""
-    loja = nome_loja(url)
+def pegar_dados(link):
+    """Acessa o link e extrai título, preços, imagem e loja."""
+    loja = nome_loja(link)
+    titulo = "Produto"
     preco_atual = None
     preco_antigo = None
+    imagem = None
 
     try:
-        resposta = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        resposta.raise_for_status()
-        soup = BeautifulSoup(resposta.text, "lxml")
+        r = requests.get(link, headers=HEADERS, timeout=10, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # 1. Tenta schema.org (mais confiável)
+        # Título
+        og_title = soup.find("meta", {"property": "og:title"})
+        if og_title and og_title.get("content"):
+            titulo = og_title["content"].strip()
+        elif soup.title:
+            titulo = soup.title.text.strip()
+
+        # Preços (schema.org primeiro, depois HTML)
         preco_atual, preco_antigo = extrair_precos_schema(soup)
-
-        # 2. Se não achou, tenta meta tags
         if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_meta(soup)
-
-        # 3. Fallback: seletores HTML
+            meta = soup.find("meta", {"property": "product:price:amount"}) or \
+                   soup.find("meta", {"itemprop": "price"})
+            if meta:
+                preco_atual = limpar_preco(meta.get("content", ""))
         if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_html(soup, url)
+            preco_atual, preco_antigo = extrair_precos_html(soup, link)
+
+        # Imagem
+        imagem = extrair_imagem(soup, link)
 
     except Exception as e:
-        print(f"Erro ao acessar {url}: {e}")
+        print(f"Erro ao acessar {link}: {e}")
 
-    return loja, preco_atual, preco_antigo
+    return titulo, loja, preco_atual, preco_antigo, imagem
 
 
 def extrair_link(texto):
-    padrao = r'https?://[^\s]+'
-    links = re.findall(padrao, texto)
-    return links[0] if links else None
+    match = re.search(r'https?://[^\s]+', texto)
+    return match.group() if match else None
 
 
-def montar_mensagem(link, loja, preco_atual, preco_antigo):
+def montar_mensagem(link, titulo, loja, preco_atual, preco_antigo):
     preco_atual_fmt = formatar_preco(preco_atual)
     preco_antigo_fmt = formatar_preco(preco_antigo)
 
-    linhas_preco = ""
     if preco_atual_fmt and preco_antigo_fmt:
-        linhas_preco = f"🏷️ De: ~~{preco_antigo_fmt}~~\n💰 Por: *{preco_atual_fmt}*"
+        linha_preco = f"🏷️ De: {preco_antigo_fmt}\n💰 Por: {preco_atual_fmt}"
     elif preco_atual_fmt:
-        linhas_preco = f"💰 Preço: *{preco_atual_fmt}*"
+        linha_preco = f"💰 Preço: {preco_atual_fmt}"
     else:
-        linhas_preco = "💰 Veja o preço no link"
+        linha_preco = "💰 Ver preço no link"
 
     return (
-        f"🔥 *SUPER PROMOÇÃO*\n\n"
-        f"🏪 Loja: *{loja}*\n"
-        f"{linhas_preco}\n\n"
-        f"👉 [COMPRAR AGORA]({link})\n\n"
-        f"⚡ Aproveite antes que acabe\\!"
+        f"🔥 PROMOÇÃO ENCONTRADA\n\n"
+        f"🛒 {titulo}\n\n"
+        f"🏪 Loja: {loja}\n"
+        f"{linha_preco}\n\n"
+        f"🚚 Pode ter frete grátis\n\n"
+        f"👉 COMPRAR AGORA\n{link}\n\n"
+        f"⚡ Oferta pode acabar a qualquer momento"
     )
 
 
-@bot.message_handler(func=lambda message: message.text and re.search(r'https?://', message.text))
-def link_handler(message):
-    link = extrair_link(message.text)
+async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    texto = update.message.text
+    if not texto or "http" not in texto:
+        return
+
+    link = extrair_link(texto)
     if not link:
         return
 
-    bot.send_message(message.chat.id, "🔍 Buscando informações do produto\\.\\.\\.", parse_mode="MarkdownV2")
+    await update.message.reply_text("🔍 Buscando informações do produto...")
 
-    loja, preco_atual, preco_antigo = buscar_info_link(link)
-    resposta = montar_mensagem(link, loja, preco_atual, preco_antigo)
+    titulo, loja, preco_atual, preco_antigo, imagem = pegar_dados(link)
+    mensagem = montar_mensagem(link, titulo, loja, preco_atual, preco_antigo)
 
-    bot.send_message(message.chat.id, resposta, parse_mode="MarkdownV2", disable_web_page_preview=False)
+    # Envia para quem mandou o link
+    if imagem:
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=imagem,
+                caption=mensagem
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=mensagem
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=mensagem
+        )
 
-
-print("Bot mypromo iniciado! Aguardando mensagens...")
-
-while True:
+    # Encaminha para o grupo
     try:
-        bot.polling(non_stop=True, timeout=30, long_polling_timeout=10)
-    except Exception as e:
-        error_msg = str(e)
-        if "409" in error_msg:
-            print("Conflito 409 detectado. Aguardando 5s para o processo anterior encerrar...")
-            time.sleep(5)
+        if imagem:
+            await context.bot.send_photo(
+                chat_id=GRUPO_ID,
+                photo=imagem,
+                caption=mensagem
+            )
         else:
-            print(f"Erro no polling: {e}. Reiniciando em 3s...")
-            time.sleep(3)
+            await context.bot.send_message(
+                chat_id=GRUPO_ID,
+                text=mensagem
+            )
+    except Exception as e:
+        print(f"Erro ao encaminhar para o grupo: {e}")
+
+
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT, responder))
+
+    print("Bot mypromo iniciado! Aguardando mensagens...")
+
+    while True:
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            await asyncio.Event().wait()
+        except Conflict:
+            print("Conflito 409 detectado. Aguardando 5s para instancia anterior encerrar...")
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+        except Exception as e:
+            print(f"Erro: {e}. Reiniciando em 3s...")
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+if __name__ == "__main__":
+    asyncio.run(main())
