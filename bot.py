@@ -291,6 +291,94 @@ def formatar_preco(valor):
         return f"R$ {valor}"
 
 
+def montar_valor_partes(fracao, centavos=None):
+    fracao_limpa = re.sub(r"\D", "", fracao or "")
+    centavos_limpos = re.sub(r"\D", "", centavos or "")
+    if not fracao_limpa:
+        return None
+    if centavos is None:
+        return fracao_limpa
+    centavos_limpos = (centavos_limpos or "00")[:2].ljust(2, "0")
+    return f"{fracao_limpa}.{centavos_limpos}"
+
+
+def extrair_preco_de_texto(soup, selectors):
+    for selector in selectors:
+        el = soup.select_one(selector)
+        if not el:
+            continue
+        valor = limpar_preco(el.get("content") or el.get_text(" ", strip=True))
+        if valor and float(valor) > 0:
+            return valor
+    return None
+
+
+def extrair_preco_por_partes(soup, amount_selectors, fraction_selector, cents_selector):
+    for selector in amount_selectors:
+        bloco = soup.select_one(selector)
+        if not bloco:
+            continue
+        fracao = bloco.select_one(fraction_selector)
+        if not fracao:
+            continue
+        centavos = bloco.select_one(cents_selector)
+        valor = montar_valor_partes(fracao.get_text(" ", strip=True), centavos.get_text(" ", strip=True) if centavos else None)
+        if valor and float(valor) > 0:
+            return valor
+    return None
+
+
+def extrair_precos_amazon(soup):
+    preco_atual = extrair_preco_de_texto(
+        soup,
+        [
+            "#corePrice_feature_div .priceToPay .a-offscreen",
+            "#corePrice_feature_div .a-price .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .priceToPay .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .a-price .a-offscreen",
+            "#priceblock_dealprice",
+            "#priceblock_ourprice",
+            "#price_inside_buybox",
+        ],
+    )
+    preco_antigo = extrair_preco_de_texto(
+        soup,
+        [
+            "#corePrice_feature_div .basisPrice .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .basisPrice .a-offscreen",
+            ".a-price.a-text-price .a-offscreen",
+            "#listPrice",
+        ],
+    )
+    return preco_atual, preco_antigo
+
+
+def extrair_precos_mercadolivre(soup):
+    preco_atual = extrair_preco_por_partes(
+        soup,
+        [
+            ".ui-pdp-price__main-container .andes-money-amount",
+            ".ui-pdp-price__second-line .andes-money-amount",
+            "[data-testid='price-part'] .andes-money-amount",
+            ".price-tag",
+        ],
+        ".andes-money-amount__fraction, .price-tag-fraction",
+        ".andes-money-amount__cents, .price-tag-cents",
+    )
+    preco_antigo = extrair_preco_por_partes(
+        soup,
+        [
+            ".ui-pdp-price__subtitles .andes-money-amount--previous",
+            ".andes-money-amount--previous",
+            ".price-tag--del",
+        ],
+        ".andes-money-amount__fraction, .price-tag-fraction",
+        ".andes-money-amount__cents, .price-tag-cents",
+    )
+    return preco_atual, preco_antigo
+
+
 def extrair_precos_schema(soup):
     preco_atual = None
     preco_antigo = None
@@ -420,7 +508,48 @@ def extrair_precos_html(soup, url):
     return preco_atual, preco_antigo
 
 
-def extrair_imagem(soup):
+def extrair_precos_loja(soup, url):
+    dominio = normalizar_host(url).replace("www.", "")
+    if "amazon." in dominio or dominio in {"a.co", "amzn.to", "amzn.com"}:
+        return extrair_precos_amazon(soup)
+    if "mercadolivre" in dominio or "mercadolibre" in dominio or dominio in {"meli.com", "mlv.io", "ml.com.br"}:
+        return extrair_precos_mercadolivre(soup)
+    return None, None
+
+
+def extrair_imagem_amazon(soup):
+    for selector in ["#landingImage", "#imgTagWrapperId img"]:
+        el = soup.select_one(selector)
+        if not el:
+            continue
+        for attr in ["data-old-hires", "src"]:
+            valor = el.get(attr)
+            if valor and valor.startswith("http"):
+                return valor
+        dinamica = el.get("data-a-dynamic-image")
+        if dinamica:
+            try:
+                dados = json.loads(dinamica)
+            except json.JSONDecodeError:
+                pass
+            else:
+                for url in dados:
+                    if isinstance(url, str) and url.startswith("http"):
+                        return url
+    meta = soup.find("meta", {"name": "twitter:image"})
+    if meta and meta.get("content"):
+        return meta["content"]
+    return None
+
+
+def extrair_imagem(soup, url=None):
+    if url:
+        dominio = normalizar_host(url).replace("www.", "")
+        if "amazon." in dominio or dominio in {"a.co", "amzn.to", "amzn.com"}:
+            imagem_amazon = extrair_imagem_amazon(soup)
+            if imagem_amazon:
+                return imagem_amazon
+
     og = soup.find("meta", {"property": "og:image"})
     if og and og.get("content"):
         return og["content"]
@@ -463,13 +592,15 @@ def pegar_dados(link):
         elif soup.title:
             titulo = soup.title.text.strip()
 
-        preco_atual, preco_antigo = extrair_precos_schema(soup)
-        if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_meta(soup)
+        preco_atual, preco_antigo = extrair_precos_loja(soup, url_final)
         if not preco_atual:
             preco_atual, preco_antigo = extrair_precos_html(soup, url_final)
+        if not preco_atual:
+            preco_atual, preco_antigo = extrair_precos_schema(soup)
+        if not preco_atual:
+            preco_atual, preco_antigo = extrair_precos_meta(soup)
 
-        imagem = extrair_imagem(soup)
+        imagem = extrair_imagem(soup, url_final)
         logger.info(
             "Scraping concluido | loja=%s preco=%s antigo=%s url_final=%s",
             loja,
@@ -557,7 +688,7 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensagem = montar_mensagem(
-        dados["url_final"],
+        link,
         dados["titulo"],
         dados["loja"],
         dados["preco_atual"],

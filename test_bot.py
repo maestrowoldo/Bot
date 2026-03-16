@@ -1,6 +1,7 @@
 import unittest
 
 import bot
+from bs4 import BeautifulSoup
 
 
 class BotValidationTests(unittest.TestCase):
@@ -24,14 +25,48 @@ class BotValidationTests(unittest.TestCase):
 
     def test_montar_mensagem_uses_price_and_final_link(self):
         mensagem = bot.montar_mensagem(
-            "https://www.amazon.com.br/produto",
+            "https://meli.la/abc123",
             "Notebook",
             "Amazon",
             "1299.90",
             "1499.90",
         )
         self.assertIn("R$ 1.299,90", mensagem)
-        self.assertIn("https://www.amazon.com.br/produto", mensagem)
+        self.assertIn("https://meli.la/abc123", mensagem)
+
+    def test_extracts_amazon_image_from_dynamic_image(self):
+        soup = BeautifulSoup(
+            """
+            <div id="imgTagWrapperId">
+              <img data-a-dynamic-image='{"https://images.amazon.com/produto.jpg":[500,500]}' />
+            </div>
+            """,
+            "html.parser",
+        )
+        self.assertEqual(
+            bot.extrair_imagem(soup, "https://www.amazon.com.br/produto"),
+            "https://images.amazon.com/produto.jpg",
+        )
+
+    def test_extracts_mercadolivre_price_from_fraction_and_cents(self):
+        soup = BeautifulSoup(
+            """
+            <div class="ui-pdp-price__main-container">
+              <span class="andes-money-amount">
+                <span class="andes-money-amount__fraction">129</span>
+                <span class="andes-money-amount__cents">00</span>
+              </span>
+            </div>
+            <div class="ui-pdp-price__subtitles">
+              <span class="andes-money-amount--previous">
+                <span class="andes-money-amount__fraction">150</span>
+                <span class="andes-money-amount__cents">00</span>
+              </span>
+            </div>
+            """,
+            "html.parser",
+        )
+        self.assertEqual(bot.extrair_precos_loja(soup, "https://www.mercadolivre.com.br/item"), ("129.00", "150.00"))
 
 
 if __name__ == "__main__":
