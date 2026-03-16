@@ -225,18 +225,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pytelegrambotapi"
-version = "4.32.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/60/f5fb7dedc4b78135a8bbb247d9b619b50e6ea13925b247f9b0c70142d1aa/pytelegrambotapi-4.32.0.tar.gz", hash = "sha256:01d36a5c0df9d1293fc768a802542ad7f4aeb3fcd5d1574b5116d935b3a3313a", size = 1374159, upload-time = "2026-03-09T20:20:56.17Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e4/e8/4fccc4094155749b46482b790d65ec0f930da076070deaea7364d955c8a8/pytelegrambotapi-4.32.0-py3-none-any.whl", hash = "sha256:ed973b302bc7014d06a7ad3cadd76a02e79498ff1e2c4be9e5ca96b0ba352d63", size = 303282, upload-time = "2026-03-09T20:20:54.325Z" },
-]
-
-[[package]]
 name = "python-telegram-bot"
 version = "22.6"
 source = { registry = "https://pypi.org/simple" }
@@ -256,7 +244,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "lxml" },
-    { name = "pytelegrambotapi" },
     { name = "python-telegram-bot" },
     { name = "requests" },
 ]
@@ -265,7 +252,6 @@ dependencies = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "lxml", specifier = ">=6.0.2" },
-    { name = "pytelegrambotapi", specifier = ">=4.32.0" },
     { name = "python-telegram-bot", specifier = ">=22.6" },
     { name = "requests", specifier = ">=2.32.5" },
 ]
