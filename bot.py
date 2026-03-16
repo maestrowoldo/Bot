@@ -292,6 +292,26 @@ def formatar_preco(valor):
         return f"R$ {valor}"
 
 
+def limpar_titulo_produto(texto):
+    if not texto:
+        return "Produto"
+
+    titulo = " ".join(str(texto).split())
+    padroes = [
+        r"\s*[-|:]\s*R\$\s?\d[\d\.,]*",
+        r"\s+[Pp]or\s+R\$\s?\d[\d\.,]*",
+        r"\s+[Dd]e\s+R\$\s?\d[\d\.,]*",
+        r"\s+R\$\s?\d[\d\.,]*",
+        r"\s+em\s+\d{1,2}x\s+de\s+R\$\s?\d[\d\.,]*",
+        r"\s+\d{1,2}x\s+de\s+R\$\s?\d[\d\.,]*",
+    ]
+    for padrao in padroes:
+        titulo = re.sub(padrao, "", titulo)
+
+    titulo = re.sub(r"\s*[\-|:]\s*$", "", titulo).strip()
+    return titulo or "Produto"
+
+
 def montar_valor_partes(fracao, centavos=None):
     fracao_limpa = re.sub(r"\D", "", fracao or "")
     centavos_limpos = re.sub(r"\D", "", centavos or "")
@@ -537,7 +557,12 @@ def combinar_precos(*fontes):
 
     if preco_antigo and preco_atual:
         try:
-            if float(preco_antigo) <= float(preco_atual):
+            valor_atual = float(preco_atual)
+            valor_antigo = float(preco_antigo)
+            if valor_atual > valor_antigo:
+                preco_atual, preco_antigo = preco_antigo, preco_atual
+                valor_atual, valor_antigo = valor_antigo, valor_atual
+            if valor_antigo <= valor_atual:
                 preco_antigo = None
         except ValueError:
             pass
@@ -654,6 +679,7 @@ def pegar_dados(link):
             titulo = og_title["content"].strip()
         elif soup.title:
             titulo = soup.title.text.strip()
+        titulo = limpar_titulo_produto(titulo)
 
         precos_loja = extrair_precos_loja(soup, url_final)
         precos_html = extrair_precos_html(soup, url_final)

@@ -74,6 +74,18 @@ class BotValidationTests(unittest.TestCase):
             ("129.00", "150.00"),
         )
 
+    def test_combinar_precos_corrige_ordem_invertida(self):
+        self.assertEqual(
+            bot.combinar_precos(("150.00", "129.00")),
+            ("129.00", "150.00"),
+        )
+
+    def test_limpar_titulo_produto_remove_preco_embutido(self):
+        self.assertEqual(
+            bot.limpar_titulo_produto("Notebook Gamer - R$ 8.279,10 em 10x de R$ 827,91"),
+            "Notebook Gamer",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
