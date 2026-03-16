@@ -68,6 +68,23 @@ class BotValidationTests(unittest.TestCase):
         )
         self.assertEqual(bot.extrair_precos_loja(soup, "https://www.mercadolivre.com.br/item"), ("129.00", "150.00"))
 
+    def test_extracts_mercadolivre_old_price_from_strikethrough_text(self):
+        soup = BeautifulSoup(
+            """
+            <div class="ui-pdp-price__main-container">
+              <span class="andes-money-amount">
+                <span class="andes-money-amount__fraction">129</span>
+                <span class="andes-money-amount__cents">00</span>
+              </span>
+            </div>
+            <div class="ui-pdp-price__subtitles">
+              <s>R$ 150,00</s>
+            </div>
+            """,
+            "html.parser",
+        )
+        self.assertEqual(bot.extrair_precos_loja(soup, "https://www.mercadolivre.com.br/item"), ("129.00", "150.00"))
+
     def test_combinar_precos_preenche_preco_antigo_de_fonte_secundaria(self):
         self.assertEqual(
             bot.combinar_precos(("129.00", None), (None, "150.00"), (None, None)),

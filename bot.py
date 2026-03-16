@@ -334,6 +334,25 @@ def extrair_preco_de_texto(soup, selectors):
     return None
 
 
+def extrair_precos_de_texto(soup, selectors):
+    valores = []
+    vistos = set()
+    for selector in selectors:
+        for el in soup.select(selector):
+            valor = limpar_preco(el.get("content") or el.get_text(" ", strip=True))
+            if not valor:
+                continue
+            try:
+                numero = float(valor)
+            except ValueError:
+                continue
+            if numero <= 0 or valor in vistos:
+                continue
+            vistos.add(valor)
+            valores.append(valor)
+    return valores
+
+
 def extrair_preco_por_partes(soup, amount_selectors, fraction_selector, cents_selector):
     for selector in amount_selectors:
         bloco = soup.select_one(selector)
@@ -347,6 +366,54 @@ def extrair_preco_por_partes(soup, amount_selectors, fraction_selector, cents_se
         if valor and float(valor) > 0:
             return valor
     return None
+
+
+def extrair_precos_por_partes(soup, amount_selectors, fraction_selector, cents_selector):
+    valores = []
+    vistos = set()
+    for selector in amount_selectors:
+        for bloco in soup.select(selector):
+            fracao = bloco.select_one(fraction_selector)
+            if not fracao:
+                continue
+            centavos = bloco.select_one(cents_selector)
+            valor = montar_valor_partes(
+                fracao.get_text(" ", strip=True),
+                centavos.get_text(" ", strip=True) if centavos else None,
+            )
+            if not valor or valor in vistos:
+                continue
+            try:
+                numero = float(valor)
+            except ValueError:
+                continue
+            if numero <= 0:
+                continue
+            vistos.add(valor)
+            valores.append(valor)
+    return valores
+
+
+def escolher_preco_antigo(preco_atual, candidatos):
+    if not preco_atual:
+        return candidatos[0] if candidatos else None
+    try:
+        valor_atual = float(preco_atual)
+    except ValueError:
+        return candidatos[0] if candidatos else None
+
+    validos = []
+    for candidato in candidatos:
+        try:
+            numero = float(candidato)
+        except ValueError:
+            continue
+        if numero > valor_atual:
+            validos.append((numero, candidato))
+
+    if not validos:
+        return None
+    return min(validos, key=lambda item: item[0])[1]
 
 
 def extrair_precos_amazon(soup):
@@ -388,22 +455,40 @@ def extrair_precos_mercadolivre(soup):
         [
             ".ui-pdp-price__main-container .andes-money-amount",
             ".ui-pdp-price__second-line .andes-money-amount",
+            ".ui-pdp-price__current-value .andes-money-amount",
             "[data-testid='price-part'] .andes-money-amount",
             ".price-tag",
         ],
         ".andes-money-amount__fraction, .price-tag-fraction",
         ".andes-money-amount__cents, .price-tag-cents",
     )
-    preco_antigo = extrair_preco_por_partes(
+
+    candidatos_partes = extrair_precos_por_partes(
         soup,
         [
+            ".ui-pdp-price__original-value .andes-money-amount",
             ".ui-pdp-price__subtitles .andes-money-amount--previous",
             ".andes-money-amount--previous",
+            "s .andes-money-amount",
+            "del .andes-money-amount",
             ".price-tag--del",
         ],
         ".andes-money-amount__fraction, .price-tag-fraction",
         ".andes-money-amount__cents, .price-tag-cents",
     )
+    candidatos_texto = extrair_precos_de_texto(
+        soup,
+        [
+            ".ui-pdp-price__original-value",
+            ".ui-pdp-price__subtitles s",
+            ".ui-pdp-price__subtitles del",
+            ".andes-money-amount--previous",
+            ".price-tag--del",
+            "s",
+            "del",
+        ],
+    )
+    preco_antigo = escolher_preco_antigo(preco_atual, candidatos_partes + candidatos_texto)
     return preco_atual, preco_antigo
 
 
