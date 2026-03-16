@@ -1,4 +1,5 @@
 import asyncio
+from io import BytesIO
 import ipaddress
 import json
 import logging
@@ -336,7 +337,9 @@ def extrair_precos_amazon(soup):
             "#corePrice_feature_div .a-price .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .priceToPay .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
+            "#apex_desktop .apexPriceToPay .a-offscreen",
             "#apex_desktop .a-price .a-offscreen",
+            "#desktop_buybox .priceToPay .a-offscreen",
             "#priceblock_dealprice",
             "#priceblock_ourprice",
             "#price_inside_buybox",
@@ -347,7 +350,12 @@ def extrair_precos_amazon(soup):
         [
             "#corePrice_feature_div .basisPrice .a-offscreen",
             "#corePriceDisplay_desktop_feature_div .basisPrice .a-offscreen",
+            "#apex_desktop .basisPrice .a-offscreen",
+            "#corePrice_feature_div .a-price.a-text-price .a-offscreen",
+            "#corePriceDisplay_desktop_feature_div .a-price.a-text-price .a-offscreen",
             ".a-price.a-text-price .a-offscreen",
+            ".basisPrice .a-offscreen",
+            ".priceBlockStrikePriceString",
             "#listPrice",
         ],
     )
@@ -517,6 +525,26 @@ def extrair_precos_loja(soup, url):
     return None, None
 
 
+def combinar_precos(*fontes):
+    preco_atual = None
+    preco_antigo = None
+
+    for atual, antigo in fontes:
+        if not preco_atual and atual:
+            preco_atual = atual
+        if not preco_antigo and antigo:
+            preco_antigo = antigo
+
+    if preco_antigo and preco_atual:
+        try:
+            if float(preco_antigo) <= float(preco_atual):
+                preco_antigo = None
+        except ValueError:
+            pass
+
+    return preco_atual, preco_antigo
+
+
 def extrair_imagem_amazon(soup):
     for selector in ["#landingImage", "#imgTagWrapperId img"]:
         el = soup.select_one(selector)
@@ -539,6 +567,16 @@ def extrair_imagem_amazon(soup):
     meta = soup.find("meta", {"name": "twitter:image"})
     if meta and meta.get("content"):
         return meta["content"]
+    for script in soup.find_all("script"):
+        conteudo = script.string or script.get_text(" ", strip=True)
+        if not conteudo:
+            continue
+        match = re.search(r'"hiRes"\s*:\s*"([^"]+)"', conteudo)
+        if match:
+            return match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+        match = re.search(r'"large"\s*:\s*"([^"]+)"', conteudo)
+        if match:
+            return match.group(1).replace("\\u0026", "&").replace("\\/", "/")
     return None
 
 
@@ -574,6 +612,31 @@ def extrair_imagem(soup, url=None):
     return None
 
 
+def baixar_imagem(url):
+    with requests.Session() as session:
+        resposta = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, stream=True)
+        resposta.raise_for_status()
+        content_type = resposta.headers.get("Content-Type", "").lower()
+        if not content_type.startswith("image/"):
+            resposta.close()
+            raise ScrapeError("A URL da imagem nao retornou um arquivo de imagem valido.")
+
+        buffer = BytesIO()
+        total = 0
+        for chunk in resposta.iter_content(chunk_size=32_768):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_HTML_BYTES:
+                resposta.close()
+                raise ScrapeError("A imagem do produto excede o limite de tamanho permitido.")
+            buffer.write(chunk)
+        resposta.close()
+        buffer.seek(0)
+        buffer.name = "produto.jpg"
+        return buffer
+
+
 def pegar_dados(link):
     with requests.Session() as session:
         try:
@@ -592,21 +655,28 @@ def pegar_dados(link):
         elif soup.title:
             titulo = soup.title.text.strip()
 
-        preco_atual, preco_antigo = extrair_precos_loja(soup, url_final)
-        if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_html(soup, url_final)
-        if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_schema(soup)
-        if not preco_atual:
-            preco_atual, preco_antigo = extrair_precos_meta(soup)
+        precos_loja = extrair_precos_loja(soup, url_final)
+        precos_html = extrair_precos_html(soup, url_final)
+        precos_schema = extrair_precos_schema(soup)
+        precos_meta = extrair_precos_meta(soup)
+        preco_atual, preco_antigo = combinar_precos(
+            precos_loja,
+            precos_schema,
+            precos_meta,
+            precos_html,
+        )
 
         imagem = extrair_imagem(soup, url_final)
         logger.info(
-            "Scraping concluido | loja=%s preco=%s antigo=%s url_final=%s",
+            "Scraping concluido | loja=%s preco=%s antigo=%s url_final=%s fontes=%s/%s/%s/%s",
             loja,
             preco_atual,
             preco_antigo,
             url_final,
+            precos_loja,
+            precos_schema,
+            precos_meta,
+            precos_html,
         )
 
         if not preco_atual:
@@ -697,9 +767,10 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if dados["imagem"]:
         try:
+            imagem_bytes = baixar_imagem(dados["imagem"])
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=dados["imagem"],
+                photo=imagem_bytes,
                 caption=mensagem,
                 parse_mode="HTML",
             )

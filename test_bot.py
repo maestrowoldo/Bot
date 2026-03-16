@@ -68,6 +68,12 @@ class BotValidationTests(unittest.TestCase):
         )
         self.assertEqual(bot.extrair_precos_loja(soup, "https://www.mercadolivre.com.br/item"), ("129.00", "150.00"))
 
+    def test_combinar_precos_preenche_preco_antigo_de_fonte_secundaria(self):
+        self.assertEqual(
+            bot.combinar_precos(("129.00", None), (None, "150.00"), (None, None)),
+            ("129.00", "150.00"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
