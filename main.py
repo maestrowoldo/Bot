@@ -1,5 +1,5 @@
 def main():
-    print("Hello from repl-nix-workspace!")
+    print("Use bot.py as the Telegram bot entrypoint.")
 
 
 if __name__ == "__main__":

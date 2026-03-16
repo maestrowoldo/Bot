@@ -9,10 +9,11 @@ Includes a Telegram bot (`bot.py`) that automatically responds to links with a p
 ## Telegram Bot (mypromo)
 
 - **File**: `bot.py` (at the project root)
-- **Runtime**: Python 3.12 + pyTelegramBotAPI
+- **Runtime**: Python 3.12 + python-telegram-bot
 - **Workflow**: "Bot Telegram mypromo" (console, always running)
 - **Secret**: `TELEGRAM_BOT_TOKEN` (set in Replit Secrets)
 - **Behavior**: When any message containing a URL (`http://` or `https://`) is received, the bot replies with a formatted promotional message including the link.
+- **Security**: accepts only supported store domains, blocks local/internal hosts, and no longer auto-forwards messages to another Telegram chat
 
 ## Stack
 
@@ -66,7 +67,7 @@ Express 5 API server. Routes live in `src/routes/` and use `@workspace/api-zod` 
 
 - Entry: `src/index.ts` — reads `PORT`, starts Express
 - App setup: `src/app.ts` — mounts CORS, JSON/urlencoded parsing, routes at `/api`
-- Routes: `src/routes/index.ts` mounts sub-routers; `src/routes/health.ts` exposes `GET /health` (full path: `/api/health`)
+- Routes: `src/routes/index.ts` mounts sub-routers; `src/routes/health.ts` exposes `GET /healthz` (full path: `/api/healthz`)
 - Depends on: `@workspace/db`, `@workspace/api-zod`
 - `pnpm --filter @workspace/api-server run dev` — run the dev server
 - `pnpm --filter @workspace/api-server run build` — production esbuild bundle (`dist/index.cjs`)
