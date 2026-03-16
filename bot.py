@@ -7,13 +7,25 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.error import Conflict
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+
+try:
+    from telegram import Update
+    from telegram.error import Conflict
+    from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+except ModuleNotFoundError:
+    Update = Any
+    Conflict = RuntimeError
+    ApplicationBuilder = None
+    MessageHandler = None
+    filters = None
+
+    class ContextTypes:
+        DEFAULT_TYPE = Any
 
 # Linux/Replit target: keep the runtime assumptions explicit.
 PID_FILE = Path(os.environ.get("MYPROMO_PID_FILE", "/tmp/mypromo_bot.pid"))
@@ -33,6 +45,7 @@ LOJAS = {
     "mercadolivre.com.br": "Mercado Livre",
     "mercadolibre.com": "Mercado Livre",
     "meli.com": "Mercado Livre",
+    "meli.la": "Mercado Livre",
     "mlv.io": "Mercado Livre",
     "ml.com.br": "Mercado Livre",
     # Amazon
@@ -67,7 +80,7 @@ LOJAS = {
     "adidas.com.br": "Adidas",
 }
 
-DOMINIOS_REDIRECIONADORES = {"meli.com", "mlv.io", "ml.com.br", "amzn.to", "amzn.com", "a.co"}
+DOMINIOS_REDIRECIONADORES = {"meli.com", "meli.la", "mlv.io", "ml.com.br", "amzn.to", "amzn.com", "a.co"}
 
 HEADERS = {
     "User-Agent": (
@@ -263,6 +276,67 @@ def abrir_url_html(session, link):
     raise ScrapeError("O link excedeu o numero maximo de redirecionamentos permitidos.")
 
 
+def extrair_url_produto_mercadolivre(soup, url_atual):
+    parsed = urlparse(url_atual)
+    if "mercadolivre" not in parsed.netloc and "mercadolibre" not in parsed.netloc:
+        return None
+    if not parsed.path.startswith("/social/"):
+        return None
+
+    candidatos = []
+
+    canonical = soup.find("link", {"rel": "canonical"})
+    if canonical and canonical.get("href"):
+        candidatos.append(canonical["href"])
+
+    for prop in ["og:url", "al:web:url"]:
+        meta = soup.find("meta", {"property": prop})
+        if meta and meta.get("content"):
+            candidatos.append(meta["content"])
+
+    for meta_name in ["twitter:url"]:
+        meta = soup.find("meta", {"name": meta_name})
+        if meta and meta.get("content"):
+            candidatos.append(meta["content"])
+
+    for script in soup.find_all("script"):
+        conteudo = script.string or script.get_text(" ", strip=True)
+        if not conteudo:
+            continue
+        for match in re.findall(r"https://(?:www\.)?mercadolivre\.com\.br/[^\s\"'<>]+", conteudo):
+            candidatos.append(match.replace("\\u002F", "/").replace("\\/", "/"))
+        for match in re.findall(r"https://(?:www\.)?mercadolibre\.com/[^\s\"'<>]+", conteudo):
+            candidatos.append(match.replace("\\u002F", "/").replace("\\/", "/"))
+
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href:
+            continue
+        absoluto = urljoin(url_atual, href)
+        candidatos.append(absoluto)
+
+    vistos = set()
+    for candidato in candidatos:
+        if not candidato or candidato in vistos:
+            continue
+        vistos.add(candidato)
+        try:
+            host = normalizar_host(candidato)
+        except BotValidationError:
+            continue
+        if host_bloqueado(host):
+            continue
+        caminho = urlparse(candidato).path
+        if "/social/" in caminho:
+            continue
+        if any(chave in host for chave in ("mercadolivre", "mercadolibre")) and (
+            "/p/" in caminho or "/MLB-" in caminho or "/MLA-" in caminho or "/item/" in caminho
+        ):
+            return candidato
+
+    return None
+
+
 def limpar_preco(texto):
     if not texto:
         return None
@@ -323,12 +397,47 @@ def montar_valor_partes(fracao, centavos=None):
     return f"{fracao_limpa}.{centavos_limpos}"
 
 
+def elemento_esta_riscado(el):
+    atual = el
+    while atual is not None and getattr(atual, "name", None):
+        if atual.name in {"s", "del", "strike"}:
+            return True
+        classes = atual.get("class") or []
+        if any(
+            classe in {
+                "andes-money-amount--previous",
+                "price-tag--del",
+                "ui-pdp-price__original-value",
+                "ui-pdp-price__subtitles",
+                "price__old",
+                "old-price",
+                "list-price",
+                "strikethrough",
+            }
+            for classe in classes
+        ):
+            return True
+        atual = getattr(atual, "parent", None)
+    return False
+
+
+def extrair_valor_do_elemento(el):
+    fracao = el.select_one(".andes-money-amount__fraction, .price-tag-fraction")
+    if fracao:
+        centavos = el.select_one(".andes-money-amount__cents, .price-tag-cents")
+        return montar_valor_partes(
+            fracao.get_text(" ", strip=True),
+            centavos.get_text(" ", strip=True) if centavos else None,
+        )
+    return limpar_preco(el.get("content") or el.get_text(" ", strip=True))
+
+
 def extrair_preco_de_texto(soup, selectors):
     for selector in selectors:
         el = soup.select_one(selector)
         if not el:
             continue
-        valor = limpar_preco(el.get("content") or el.get_text(" ", strip=True))
+        valor = extrair_valor_do_elemento(el)
         if valor and float(valor) > 0:
             return valor
     return None
@@ -339,7 +448,7 @@ def extrair_precos_de_texto(soup, selectors):
     vistos = set()
     for selector in selectors:
         for el in soup.select(selector):
-            valor = limpar_preco(el.get("content") or el.get_text(" ", strip=True))
+            valor = extrair_valor_do_elemento(el)
             if not valor:
                 continue
             try:
@@ -396,11 +505,11 @@ def extrair_precos_por_partes(soup, amount_selectors, fraction_selector, cents_s
 
 def escolher_preco_antigo(preco_atual, candidatos):
     if not preco_atual:
-        return candidatos[0] if candidatos else None
+        return None
     try:
         valor_atual = float(preco_atual)
     except ValueError:
-        return candidatos[0] if candidatos else None
+        return None
 
     validos = []
     for candidato in candidatos:
@@ -414,6 +523,37 @@ def escolher_preco_antigo(preco_atual, candidatos):
     if not validos:
         return None
     return min(validos, key=lambda item: item[0])[1]
+
+
+def extrair_preco_riscado_e_normal(soup, seletores_preco):
+    precos_normais = []
+    precos_riscados = []
+    vistos_normais = set()
+    vistos_riscados = set()
+
+    for seletor in seletores_preco:
+        for el in soup.select(seletor):
+            valor = extrair_valor_do_elemento(el)
+            if not valor:
+                continue
+            try:
+                numero = float(valor)
+            except ValueError:
+                continue
+            if numero <= 0:
+                continue
+            if elemento_esta_riscado(el):
+                if valor not in vistos_riscados:
+                    vistos_riscados.add(valor)
+                    precos_riscados.append(valor)
+            else:
+                if valor not in vistos_normais:
+                    vistos_normais.add(valor)
+                    precos_normais.append(valor)
+
+    preco_atual = min(precos_normais, key=lambda v: float(v)) if precos_normais else None
+    preco_antigo = escolher_preco_antigo(preco_atual, precos_riscados)
+    return preco_atual, preco_antigo
 
 
 def extrair_precos_amazon(soup):
@@ -449,19 +589,145 @@ def extrair_precos_amazon(soup):
     return preco_atual, preco_antigo
 
 
+def extrair_preco_pix_mercadolivre(soup):
+    for bloco in soup.select(".ui-pdp-price__second-line"):
+        texto = bloco.get_text(" ", strip=True).lower()
+        if "pix" not in texto:
+            continue
+
+        for seletor in [
+            ".ui-pdp-price__part__container .andes-money-amount",
+            ".andes-money-amount",
+            ".price-tag",
+        ]:
+            money = bloco.select_one(seletor)
+            if not money:
+                continue
+            valor = extrair_valor_do_elemento(money)
+            if valor:
+                return valor
+
+        valor = extrair_valor_do_elemento(bloco)
+        if valor:
+            return valor
+
+    for label in soup.find_all(string=re.compile(r"pix", re.IGNORECASE)):
+        parent = getattr(label, "parent", None)
+        while parent is not None and getattr(parent, "name", None):
+            if "ui-pdp-price__subtitles" in " ".join(parent.get("class") or []):
+                parent = getattr(parent, "parent", None)
+                continue
+            money = parent.select_one(":scope > .ui-pdp-price__part__container .andes-money-amount, :scope > .andes-money-amount, :scope > .price-tag")
+            if money:
+                valor = extrair_valor_do_elemento(money)
+                if valor:
+                    return valor
+            parent = getattr(parent, "parent", None)
+    return None
+
+
+def extrair_precos_mercadolivre_script(soup):
+    candidatos = []
+
+    padroes = [
+        r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*"original_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        r'"original_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*"actual_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        r'"original_value"\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*,\s*"value"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        r'"actual_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*.*?"original_price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+    ]
+
+    for script in soup.find_all("script"):
+        conteudo = script.string or script.get_text(" ", strip=True)
+        if not conteudo:
+            continue
+        for padrao in padroes:
+            for match in re.finditer(padrao, conteudo):
+                grupos = match.groups()
+                if "original_price" in padrao or "original_value" in padrao:
+                    if padrao.startswith(r'"price"'):
+                        atual, antigo = grupos[0], grupos[1]
+                    elif padrao.startswith(r'"actual_price"'):
+                        atual, antigo = grupos[0], grupos[1]
+                    else:
+                        antigo, atual = grupos[0], grupos[1]
+                else:
+                    continue
+                try:
+                    valor_atual = float(atual)
+                    valor_antigo = float(antigo)
+                except ValueError:
+                    continue
+                if valor_atual > 0 and valor_antigo > valor_atual:
+                    candidatos.append((f"{valor_atual:.2f}", f"{valor_antigo:.2f}"))
+
+    if not candidatos:
+        return None, None
+
+    candidatos.sort(key=lambda item: (float(item[1]) - float(item[0]), float(item[0])), reverse=True)
+    return candidatos[0]
+
+
 def extrair_precos_mercadolivre(soup):
+    preco_atual_social, preco_antigo_social = extrair_preco_riscado_e_normal(
+        soup,
+        [
+            ".andes-money-amount",
+            ".price-tag",
+            ".ui-pdp-price__current-value",
+            ".ui-pdp-price__original-value",
+            "[data-testid='price-part']",
+            "[data-testid='original-price']",
+            "s",
+            "del",
+            "strike",
+        ],
+    )
+
+    preco_atual_pix = extrair_preco_pix_mercadolivre(soup)
+    preco_atual_script, preco_antigo_script = extrair_precos_mercadolivre_script(soup)
+    if preco_atual_pix or preco_antigo_script:
+        preco_atual_social = None
+        preco_antigo_social = None
+
     preco_atual = extrair_preco_por_partes(
         soup,
         [
-            ".ui-pdp-price__main-container .andes-money-amount",
             ".ui-pdp-price__second-line .andes-money-amount",
             ".ui-pdp-price__current-value .andes-money-amount",
             "[data-testid='price-part'] .andes-money-amount",
+            ".ui-pdp-price__main-price .andes-money-amount",
+            ".ui-pdp-price__price .andes-money-amount",
+            ".ui-pdp-price__main-container .andes-money-amount:not(.andes-money-amount--previous)",
+            ".ui-pdp-price__second-line .andes-money-amount:not(.andes-money-amount--previous)",
             ".price-tag",
         ],
         ".andes-money-amount__fraction, .price-tag-fraction",
         ".andes-money-amount__cents, .price-tag-cents",
     )
+
+    if preco_atual_pix:
+        preco_atual = preco_atual_pix
+    elif preco_atual_script:
+        preco_atual = preco_atual_script
+    elif not preco_atual:
+        preco_atual = preco_atual_social
+
+    if not preco_atual:
+        preco_atual = extrair_preco_de_texto(
+            soup,
+            [
+                ".ui-pdp-price__current-value",
+                "[data-testid='price-part']",
+                ".ui-pdp-price__main-price",
+                ".ui-pdp-price__price",
+            ],
+        )
+
+    if not preco_atual:
+        preco_atual = preco_atual_social
+
+    if not preco_atual and preco_atual_script:
+        preco_atual = preco_atual_script
 
     candidatos_partes = extrair_precos_por_partes(
         soup,
@@ -469,6 +735,7 @@ def extrair_precos_mercadolivre(soup):
             ".ui-pdp-price__original-value .andes-money-amount",
             ".ui-pdp-price__subtitles .andes-money-amount--previous",
             ".andes-money-amount--previous",
+            "[data-testid='original-price-part'] .andes-money-amount",
             "s .andes-money-amount",
             "del .andes-money-amount",
             ".price-tag--del",
@@ -476,6 +743,7 @@ def extrair_precos_mercadolivre(soup):
         ".andes-money-amount__fraction, .price-tag-fraction",
         ".andes-money-amount__cents, .price-tag-cents",
     )
+
     candidatos_texto = extrair_precos_de_texto(
         soup,
         [
@@ -483,12 +751,20 @@ def extrair_precos_mercadolivre(soup):
             ".ui-pdp-price__subtitles s",
             ".ui-pdp-price__subtitles del",
             ".andes-money-amount--previous",
+            "[data-testid='original-price']",
             ".price-tag--del",
             "s",
             "del",
         ],
     )
-    preco_antigo = escolher_preco_antigo(preco_atual, candidatos_partes + candidatos_texto)
+
+    if preco_antigo_script:
+        preco_antigo = escolher_preco_antigo(preco_atual, [preco_antigo_script])
+    else:
+        preco_antigo = escolher_preco_antigo(preco_atual, candidatos_partes + candidatos_texto)
+
+    if not preco_antigo and not preco_antigo_script:
+        preco_antigo = preco_antigo_social
     return preco_atual, preco_antigo
 
 
@@ -539,6 +815,8 @@ def extrair_precos_html(soup, url):
         ".offer-price",
         ".product-price",
         ".product__price",
+        "[data-testid='price']",
+        ".priceToPay",
     ]
     seletores_antigo = [
         ".old-price",
@@ -546,6 +824,13 @@ def extrair_precos_html(soup, url):
         ".was-price",
         ".preco-antigo",
         ".price__old",
+        ".original-price",
+        ".list-price",
+        "[data-testid='original-price']",
+        "[data-testid='list-price']",
+        ".price--original",
+        ".price--before",
+        ".strikethrough",
         "s",
         "del",
         "strike",
@@ -557,10 +842,20 @@ def extrair_precos_html(soup, url):
                 ".andes-money-amount__fraction",
                 ".price-tag-fraction",
                 ".ui-pdp-price__second-line .andes-money-amount__fraction",
+                ".ui-pdp-price__main-price .andes-money-amount__fraction",
+                "[data-testid='price-part'] .andes-money-amount__fraction",
+                # Seletores mais específicos para preço com desconto
+                ".ui-pdp-price__current-value .andes-money-amount__fraction",
+                ".ui-pdp-price__main-container .andes-money-amount__fraction:first-of-type",
             ],
             [
                 ".andes-money-amount--previous .andes-money-amount__fraction",
                 ".price-tag--del .price-tag-fraction",
+                ".ui-pdp-price__original-value .andes-money-amount__fraction",
+                # Preços riscados (strikethrough)
+                "s .andes-money-amount__fraction",
+                "del .andes-money-amount__fraction",
+                "strike .andes-money-amount__fraction",
             ],
         ),
         "amazon": (
@@ -574,23 +869,24 @@ def extrair_precos_html(soup, url):
                 ".a-text-strike .a-offscreen",
                 "#listPrice",
                 ".a-price.a-text-price .a-offscreen",
+                ".basisPrice .a-offscreen",
             ],
         ),
         "magazineluiza": (
             ["[data-testid='price-value']", ".price__current", ".sc-ckVGcZ"],
-            ["[data-testid='original-price']", ".price__original"],
+            ["[data-testid='original-price']", ".price__original", ".price__before"],
         ),
         "americanas": (
             ["[data-testid='price']", ".priceSales"],
-            ["[data-testid='list-price']", ".priceStandard"],
+            ["[data-testid='list-price']", ".priceStandard", ".price__list"],
         ),
         "casasbahia": (
             ["[data-testid='price-value']", ".price__current--value"],
-            ["[data-testid='original-price']", ".price__old--value"],
+            ["[data-testid='original-price']", ".price__old--value", ".price__list"],
         ),
         "kabum": (
             ["[itemprop='price']", ".regularPrice", ".finalPrice"],
-            [".oldPrice", ".oldPriceValue"],
+            [".oldPrice", ".oldPriceValue", ".listPrice"],
         ),
     }
 
@@ -611,12 +907,13 @@ def extrair_precos_html(soup, url):
 
     preco_antigo = None
     for sel in seletores_antigo:
-        el = soup.select_one(sel)
-        if el:
+        for el in soup.select(sel):
             candidato = limpar_preco(el.get_text(" ", strip=True))
-            if candidato and candidato != preco_atual:
+            if candidato and candidato != preco_atual and float(candidato) > 0:
                 preco_antigo = candidato
                 break
+        if preco_antigo:
+            break
 
     return preco_atual, preco_antigo
 
@@ -625,34 +922,88 @@ def extrair_precos_loja(soup, url):
     dominio = normalizar_host(url).replace("www.", "")
     if "amazon." in dominio or dominio in {"a.co", "amzn.to", "amzn.com"}:
         return extrair_precos_amazon(soup)
-    if "mercadolivre" in dominio or "mercadolibre" in dominio or dominio in {"meli.com", "mlv.io", "ml.com.br"}:
+    if "mercadolivre" in dominio or "mercadolibre" in dominio or dominio in {"meli.com", "mlv.io", "ml.com.br","meli.la"}:
         return extrair_precos_mercadolivre(soup)
     return None, None
 
 
 def combinar_precos(*fontes):
+    """Combina preços de múltiplas fontes de extração.
+    
+    Prioridade: 
+    1. Preços da fonte específica da loja (extrair_precos_loja) - mais confiáveis
+    2. Preços de schema (JSON-LD)
+    3. Preços de meta tags
+    4. Preços genéricos do HTML
+    
+    Garante que preco_antigo >= preco_atual e nunca promove um preco antigo
+    para preco atual.
+    """
     preco_atual = None
     preco_antigo = None
+    
+    if not fontes:
+        return None, None
+    
+    # Primeira fonte (específica da loja) tem maior prioridade
+    primeira_atual, primeira_antigo = fontes[0]
+    
+    if primeira_atual or primeira_antigo:
+        preco_atual = primeira_atual
+        preco_antigo = primeira_antigo
 
-    for atual, antigo in fontes:
-        if not preco_atual and atual:
-            preco_atual = atual
-        if not preco_antigo and antigo:
-            preco_antigo = antigo
+        if preco_atual and not preco_antigo:
+            for i in range(1, len(fontes)):
+                _, antigo = fontes[i]
+                if antigo:
+                    try:
+                        valor_atual = float(preco_atual)
+                        valor_antigo = float(antigo)
+                        if valor_antigo > valor_atual * 1.05:
+                            preco_antigo = antigo
+                            break
+                    except ValueError:
+                        pass
+    else:
+        for atual, antigo in fontes[1:]:
+            if atual and not preco_atual:
+                preco_atual = atual
+            if antigo and not preco_antigo and preco_atual:
+                preco_antigo = antigo
 
     if preco_antigo and preco_atual:
         try:
             valor_atual = float(preco_atual)
             valor_antigo = float(preco_antigo)
-            if valor_atual > valor_antigo:
-                preco_atual, preco_antigo = preco_antigo, preco_atual
-                valor_atual, valor_antigo = valor_antigo, valor_atual
-            if valor_antigo <= valor_atual:
+            if abs(valor_antigo - valor_atual) < 0.01:
+                preco_antigo = None
+            elif valor_antigo < valor_atual:
                 preco_antigo = None
         except ValueError:
             pass
 
+    if not preco_atual:
+        preco_antigo = None
+
     return preco_atual, preco_antigo
+
+
+def combinar_precos_mercadolivre(precos_loja, precos_schema, precos_meta, precos_html):
+    preco_atual_loja, preco_antigo_loja = precos_loja
+
+    if preco_atual_loja:
+        return combinar_precos(
+            precos_loja,
+            precos_schema,
+            precos_meta,
+        )
+
+    return combinar_precos(
+        precos_loja,
+        precos_schema,
+        precos_meta,
+        precos_html,
+    )
 
 
 def extrair_imagem_amazon(soup):
@@ -756,6 +1107,16 @@ def pegar_dados(link):
             raise ScrapeError("Nao consegui acessar esse link agora.") from exc
 
         soup = BeautifulSoup(html, "html.parser")
+        url_produto = extrair_url_produto_mercadolivre(soup, url_final)
+        if url_produto and url_produto != url_final:
+            logger.info("Landing social do Mercado Livre detectada. Rebuscando produto em %s", url_produto)
+            try:
+                url_final, html = abrir_url_html(session, url_produto)
+            except requests.RequestException as exc:
+                logger.warning("Erro HTTP ao buscar URL final do produto %s: %s", url_produto, exc)
+                raise ScrapeError("Nao consegui abrir a pagina real do produto.") from exc
+            soup = BeautifulSoup(html, "html.parser")
+
         titulo = "Produto"
         loja = nome_loja(url_final)
 
@@ -770,12 +1131,20 @@ def pegar_dados(link):
         precos_html = extrair_precos_html(soup, url_final)
         precos_schema = extrair_precos_schema(soup)
         precos_meta = extrair_precos_meta(soup)
-        preco_atual, preco_antigo = combinar_precos(
-            precos_loja,
-            precos_schema,
-            precos_meta,
-            precos_html,
-        )
+        if loja == "Mercado Livre":
+            preco_atual, preco_antigo = combinar_precos_mercadolivre(
+                precos_loja,
+                precos_schema,
+                precos_meta,
+                precos_html,
+            )
+        else:
+            preco_atual, preco_antigo = combinar_precos(
+                precos_loja,
+                precos_schema,
+                precos_meta,
+                precos_html,
+            )
 
         imagem = extrair_imagem(soup, url_final)
         logger.info(
@@ -898,6 +1267,12 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     global BOT_TOKEN
+    if ApplicationBuilder is None or MessageHandler is None or filters is None:
+        raise RuntimeError(
+            "python-telegram-bot nao esta instalado. Rode `pip install -r requirements.txt` "
+            "ou instale as dependencias do pyproject antes de iniciar o bot."
+        )
+
     BOT_TOKEN = carregar_config()
     garantir_instancia_unica()
 
