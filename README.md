@@ -1,4 +1,5 @@
 # Workspace
+Mypromo — Automação para Afiliados : Plataforma em monorepo com TypeScript, Express, PostgreSQL, Drizzle ORM, Zod e OpenAPI, com bot em Python/Telegram para detectar links, validar domínios e responder automaticamente com mensagens promocionais.
 
 ## Overview
 
